@@ -1,0 +1,49 @@
+name: Publish Firmware Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: espressif/idf:v5.3.1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build firmware with example provisioning
+        run: |
+          idf.py -B build/release \
+            -D FULLOCH_BOARD=waveshare_touch_lcd_185c_box_rev2 \
+            -D FULLOCH_PROVISIONING_CONFIG="$PWD/provisioning/device.config.example.json" \
+            -D FULLOCH_PROVISIONING_CREDENTIALS="$PWD/provisioning/device.credentials.example.json" \
+            build
+      - name: Package flash images
+        run: |
+          mkdir release-artifacts
+          cp build/release/bootloader/bootloader.bin release-artifacts/
+          cp build/release/partition_table/partition-table.bin release-artifacts/
+          cp build/release/ota_data_initial.bin release-artifacts/
+          cp build/release/fulloch_satellite.bin release-artifacts/
+          sha256sum release-artifacts/* > release-artifacts/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-release
+          path: release-artifacts/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: firmware-release
+          path: release-artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release-artifacts/*

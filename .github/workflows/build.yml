@@ -1,0 +1,14 @@
+name: Verify Host Checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 tools/check_format.py
+      - run: python3 -m unittest discover -s tests -p 'test_*.py'

@@ -1,0 +1,4 @@
+# Files excluded from public snapshots produced by transfer_to_pub_dir.sh.
+CLAUDE.md export-ignore
+docs/** export-ignore
+transfer_to_pub_dir.sh export-ignore

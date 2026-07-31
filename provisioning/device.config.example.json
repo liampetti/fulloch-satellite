@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "device": {
+    "id": "fulloch-example-01",
+    "name": "Example Satellite",
+    "timezone": "Australia/Sydney"
+  },
+  "server": {
+    "url": "wss://satellite.example.invalid/ws/satellite-v2"
+  },
+  "audio": {
+    "speaker_volume_percent": 65,
+    "aec_enabled": true
+  },
+  "spotify": {
+    "enabled": true
+  }
+}
