@@ -7,13 +7,6 @@
 /provisioning/*.credentials.json
 /provisioning/*.nvs.bin
 /certs/*
-.env
-.env.*
-!.env.example
-*.pem
-*.key
-*.p12
-*.pfx
 /.DS_Store
 __pycache__/
 *.py[cod]

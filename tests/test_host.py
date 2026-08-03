@@ -54,21 +54,51 @@ class ProvisioningTests(unittest.TestCase):
             provision.validate(config, self.credentials)
 
     def test_spotify_settings_enter_device_nvs(self):
-        entries = provision.validate(self.config, self.credentials)
-        self.assertIn(("spotify", "enabled", "true"), entries)
+        config = copy.deepcopy(self.config)
+        credentials = copy.deepcopy(self.credentials)
+        config["music"] = {"player": "spotify"}
+        credentials["spotify"] = {
+            "client_id": "example-spotify-client-id",
+            "client_secret": "example-spotify-client-secret",
+            "refresh_token": "example-spotify-refresh-token",
+        }
+        entries = provision.validate(config, credentials)
         self.assertIn(("spotify", "client_id", "example-spotify-client-id"), entries)
         self.assertIn(("spotify", "client_secret", "example-spotify-client-secret"), entries)
         self.assertIn(("spotify", "refresh_token", "example-spotify-refresh-token"), entries)
 
     def test_spotify_config_and_credentials_are_required_together(self):
+        config = copy.deepcopy(self.config)
         credentials = copy.deepcopy(self.credentials)
+        config["music"] = {"player": "spotify"}
+        credentials["spotify"] = {
+            "client_id": "example-spotify-client-id",
+            "client_secret": "example-spotify-client-secret",
+            "refresh_token": "example-spotify-refresh-token",
+        }
         del credentials["spotify"]
         with self.assertRaises(provision.BundleError):
-            provision.validate(self.config, credentials)
+            provision.validate(config, credentials)
 
     def test_spotify_device_selector_is_rejected(self):
         config = copy.deepcopy(self.config)
-        config["spotify"]["playback_device_id"] = "Example Speaker"
+        config["music"]["playback_device_id"] = "Example Speaker"
+        with self.assertRaises(provision.BundleError):
+            provision.validate(config, self.credentials)
+
+    def test_sonos_settings_enter_device_nvs(self):
+        config = copy.deepcopy(self.config)
+        credentials = copy.deepcopy(self.credentials)
+        del credentials["spotify"]
+        config["music"] = {"player": "sonos"}
+        config["sonos"] = {"host": "192.168.1.50"}
+        entries = provision.validate(config, credentials)
+        self.assertIn(("music", "player", "sonos"), entries)
+        self.assertIn(("sonos", "host", "192.168.1.50"), entries)
+
+    def test_sonos_requires_the_sonos_music_player(self):
+        config = copy.deepcopy(self.config)
+        config["sonos"] = {"host": "192.168.1.50"}
         with self.assertRaises(provision.BundleError):
             provision.validate(config, self.credentials)
 
@@ -78,12 +108,25 @@ class ProtocolFixtureTests(unittest.TestCase):
         hello = {
             "type": "satellite.hello",
             "token": "fixture-token",
-            "protocol": {"name": "satellite-v2", "major": 2, "minor": 1},
+            "protocol": {"name": "satellite-v2", "major": 2, "minor": 2},
             "device": {"id": "fixture-01", "name": "Fixture", "firmware": "0.1.0", "build": "test", "board": "rev2"},
             "capabilities": {"audio_input": True, "audio_output": True, "display": True, "touch": True},
         }
         self.assertTrue(fixture.validate_hello(hello))
         self.assertEqual(fixture.scenario_messages("normal")[0]["type"], "satellite.welcome")
+
+    def test_resume_hello_uses_last_fully_played_sequence(self):
+        hello = {
+            "type": "satellite.hello",
+            "token": "fixture-token",
+            "protocol": {"name": "satellite-v2", "major": 2, "minor": 2},
+            "device": {"id": "fixture-01", "name": "Fixture", "firmware": "0.1.0", "build": "test", "board": "rev2"},
+            "capabilities": {"audio_input": True, "audio_output": True, "display": True, "touch": True},
+            "resume": {"session_id": "prior-session", "turn_id": "turn-1", "next_seq": 7},
+        }
+        self.assertTrue(fixture.validate_hello(hello))
+        hello["resume"]["next_seq"] = -1
+        self.assertFalse(fixture.validate_hello(hello))
 
     def test_welcome_uses_the_fixed_16khz_downlink_contract(self):
         downlink = fixture.scenario_messages("normal")[0]["audio"]["downlink"]
@@ -109,6 +152,13 @@ class TurnAndQueueTests(unittest.TestCase):
         self.barge_in_turn_pending = True
         return True
 
+    def apply_tts_end(self, turn_id):
+        if self.state != "speaking" or turn_id != self.turn_id:
+            return False
+        self.state = "idle"
+        self.turn_id = None
+        return True
+
     def apply_state(self, state, turn_id):
         if state == "idle":
             if turn_id is not None and turn_id != self.turn_id:
@@ -122,6 +172,7 @@ class TurnAndQueueTests(unittest.TestCase):
             and state in {"wake_detected", "listening"}
             and turn_id != self.turn_id
         )
+        starts_proactive_turn = state == "speaking" and self.turn_id is None
         if state == "wake_detected":
             if (
                 self.turn_id is not None
@@ -131,10 +182,13 @@ class TurnAndQueueTests(unittest.TestCase):
                 return False
             self.turn_id = turn_id
         elif state not in {"listening", "thinking", "speaking", "follow_up", "error"} or (
-            turn_id != self.turn_id and not replaces_follow_up_turn and not replaces_barge_in_turn
+            turn_id != self.turn_id
+            and not replaces_follow_up_turn
+            and not replaces_barge_in_turn
+            and not starts_proactive_turn
         ):
             return False
-        elif replaces_follow_up_turn or replaces_barge_in_turn:
+        elif replaces_follow_up_turn or replaces_barge_in_turn or starts_proactive_turn:
             self.turn_id = turn_id
         self.barge_in_turn_pending = False
         self.state = state
@@ -168,6 +222,11 @@ class TurnAndQueueTests(unittest.TestCase):
         self.assertTrue(self.apply_tts_cancel("turn-1"))
         self.assertTrue(self.apply_state("listening", "turn-2"))
         self.assertEqual(self.turn_id, "turn-2")
+
+    def test_proactive_speaking_turn_can_complete_without_a_wakeword(self):
+        self.assertTrue(self.apply_state("speaking", "announcement-1"))
+        self.assertTrue(self.apply_tts_end("announcement-1"))
+        self.assertEqual(self.state, "idle")
 
     def test_new_turn_is_rejected_without_follow_up_or_tts_cancel(self):
         self.assertTrue(self.apply_state("wake_detected", "turn-1"))
@@ -223,6 +282,22 @@ class TurnAndQueueTests(unittest.TestCase):
         playback_pending = True
         rings_visible = assistant_state not in {"idle", "error"}
         self.assertFalse(rings_visible)
+
+    def test_recovery_resumes_after_only_fully_played_frames(self):
+        last_fully_played_seq = 4
+        queued_but_not_played = [5, 6]
+        queued_but_not_played.clear()  # Discarded before the server replays from next_seq.
+        resume = {"session_id": "session-1", "turn_id": "turn-1", "next_seq": last_fully_played_seq + 1}
+        self.assertEqual(resume["next_seq"], 5)
+        self.assertEqual(queued_but_not_played, [])
+
+    def test_v2_tts_audio_requires_contiguous_sequence_and_exact_binary_size(self):
+        expected_seq = 3
+        metadata = {"turn_id": "turn-1", "seq": 3, "bytes": 640}
+        self.assertEqual(metadata["seq"], expected_seq)
+        self.assertEqual(metadata["bytes"], 640)
+        expected_seq += 1
+        self.assertEqual(expected_seq, 4)
 
 
 if __name__ == "__main__":

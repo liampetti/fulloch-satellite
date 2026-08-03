@@ -69,7 +69,7 @@ static esp_codec_dev_handle_t capture;
 static SemaphoreHandle_t display_transfer_complete;
 static int16_t capture_samples[FULLOCH_AEC_CAPTURE_MAX_SAMPLES * FULLOCH_AEC_CAPTURE_CHANNELS];
 static uint16_t lcd_rows[LCD_WIDTH * 10];
-static int32_t playback_samples[I2S_SAMPLE_RATE_HZ / 10 * 2];
+static int32_t playback_samples[PLAYBACK_BLOCK_SAMPLES * 2];
 static const int16_t silence_samples[PLAYBACK_BLOCK_SAMPLES];
 
 typedef struct {

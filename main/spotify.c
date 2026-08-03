@@ -365,12 +365,6 @@ esp_err_t satellite_spotify_start(void)
     if (error != ESP_OK) {
         return error;
     }
-    char enabled[6];
-    error = read_nvs_string(handle, "enabled", enabled, sizeof(enabled));
-    if (error != ESP_OK || strcmp(enabled, "true") != 0) {
-        nvs_close(handle);
-        return error == ESP_OK ? ESP_OK : error;
-    }
     error = read_nvs_string(handle, "client_id", client_id, sizeof(client_id));
     if (error == ESP_OK) {
         error = read_nvs_string(handle, "client_secret", client_secret, sizeof(client_secret));

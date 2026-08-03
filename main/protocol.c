@@ -8,6 +8,7 @@
 #include "connectivity.h"
 #include "esp_check.h"
 #include "esp_app_desc.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -21,9 +22,11 @@
 #define TURN_ID_MAX_BYTES 64
 #define HEARTBEAT_MIN_MS 1000
 #define HEARTBEAT_MAX_MS 60000
+#define HEARTBEAT_MAX_UNACKNOWLEDGED_REPORTS 3
 #define IDLE_DRAIN_MS 250
 #define IDLE_RESPONSE_START_MS 5000
 #define WEBSOCKET_SEND_TIMEOUT_MS 1000
+#define TTS_RECOVERY_WINDOW_MS 2000
 
 #define WEBSOCKET_OPCODE_TEXT 0x1
 #define WEBSOCKET_OPCODE_BINARY 0x2
@@ -37,9 +40,11 @@ static char device_id[65];
 static char device_name[65];
 static char device_token[257];
 static char active_turn_id[TURN_ID_MAX_BYTES + 1];
+static char session_id[TURN_ID_MAX_BYTES + 1];
 static esp_websocket_client_handle_t protocol_websocket;
 static esp_timer_handle_t heartbeat_timer;
 static esp_timer_handle_t idle_drain_timer;
+static esp_timer_handle_t recovery_timer;
 static SemaphoreHandle_t websocket_send_lock;
 static bool protocol_ready;
 static bool stop_pending;
@@ -48,9 +53,63 @@ static bool barge_in_turn_pending;
 static satellite_assistant_state_t assistant_state = SATELLITE_ASSISTANT_IDLE;
 static uint32_t uplink_frames_sent;
 static int64_t last_uplink_send_us;
-static int16_t downlink_payload_samples[DOWNLINK_MAX_BYTES / sizeof(int16_t)];
+static volatile uint32_t heartbeat_acknowledgements;
+static uint32_t observed_heartbeat_acknowledgements;
+static uint8_t unacknowledged_health_reports;
+static int16_t *downlink_payload_samples;
 static size_t downlink_payload_bytes;
 static size_t downlink_payload_length;
+static bool tts_audio_pending;
+static size_t tts_audio_bytes;
+static uint32_t tts_audio_sequence;
+static uint32_t expected_downlink_sequence;
+static uint32_t last_played_sequence;
+static bool last_played_sequence_valid;
+static bool recovery_pending;
+static int protocol_minor;
+
+static void clear_tts_audio_pending(void)
+{
+    tts_audio_pending = false;
+    tts_audio_bytes = 0;
+}
+
+static void discard_tts_audio_pending(void)
+{
+    if (tts_audio_pending) {
+        expected_downlink_sequence = tts_audio_sequence;
+    }
+    clear_tts_audio_pending();
+}
+
+static void clear_recovery_state(void)
+{
+    recovery_pending = false;
+    session_id[0] = '\0';
+    active_turn_id[0] = '\0';
+    expected_downlink_sequence = 0;
+    last_played_sequence = 0;
+    last_played_sequence_valid = false;
+    protocol_minor = 0;
+    clear_tts_audio_pending();
+    if (recovery_timer != NULL && esp_timer_is_active(recovery_timer)) {
+        esp_timer_stop(recovery_timer);
+    }
+}
+
+static void recovery_timer_callback(void *argument)
+{
+    (void)argument;
+    if (!recovery_pending) {
+        return;
+    }
+    ESP_LOGW(TAG, "TTS reconnect recovery window expired");
+    clear_recovery_state();
+    assistant_state = SATELLITE_ASSISTANT_IDLE;
+    satellite_audio_reset();
+    satellite_ui_post_assistant_state(assistant_state);
+    satellite_ui_post_connection_status(SATELLITE_CONNECTION_SERVER_CONNECTING);
+}
 
 static bool json_string(const cJSON *object, const char *name, const char **value)
 {
@@ -111,6 +170,10 @@ static void heartbeat_timer_callback(void *argument)
     if (!protocol_ready || protocol_websocket == NULL) {
         return;
     }
+    if (heartbeat_acknowledgements != observed_heartbeat_acknowledgements) {
+        observed_heartbeat_acknowledgements = heartbeat_acknowledgements;
+        unacknowledged_health_reports = 0;
+    }
     const satellite_audio_metrics_t metrics = satellite_audio_metrics();
     const int health_length = snprintf(
         health, sizeof(health),
@@ -120,9 +183,11 @@ static void heartbeat_timer_callback(void *argument)
         (unsigned long)metrics.capture_overruns, (unsigned long)metrics.playback_underruns);
     if (health_length < 0 || health_length >= (int)sizeof(health)) {
         ESP_LOGW(TAG, "Unable to format health report");
+        return;
     } else if (xSemaphoreTake(websocket_send_lock, pdMS_TO_TICKS(1000)) != pdPASS) {
         ESP_LOGW(TAG, "Unable to acquire WebSocket send lock for health report");
         reconnect_after_send_failure();
+        return;
     } else {
         bool send_failed = false;
         if (!protocol_ready || protocol_websocket == NULL ||
@@ -134,7 +199,15 @@ static void heartbeat_timer_callback(void *argument)
         xSemaphoreGive(websocket_send_lock);
         if (send_failed) {
             reconnect_after_send_failure();
+            return;
         }
+    }
+    unacknowledged_health_reports++;
+    if (unacknowledged_health_reports >= HEARTBEAT_MAX_UNACKNOWLEDGED_REPORTS) {
+        ESP_LOGW(TAG, "Server did not acknowledge %u health reports; reconnecting",
+                 HEARTBEAT_MAX_UNACKNOWLEDGED_REPORTS);
+        reconnect_after_send_failure();
+        return;
     }
     ESP_LOGI(TAG, "Protocol ready; sent %lu uplink audio frames", (unsigned long)uplink_frames_sent);
 }
@@ -143,12 +216,12 @@ static void complete_idle_state(void)
 {
     const bool was_speaking = assistant_state == SATELLITE_ASSISTANT_SPEAKING;
 
-    active_turn_id[0] = '\0';
+    clear_recovery_state();
     stop_pending = false;
     barge_in_turn_pending = false;
     assistant_state = SATELLITE_ASSISTANT_IDLE;
     if (was_speaking) {
-        satellite_audio_log_playback_diagnostics();
+        satellite_audio_finish_playback();
     }
     satellite_ui_post_assistant_state(assistant_state);
 }
@@ -207,8 +280,8 @@ static bool validate_welcome(const cJSON *welcome)
 
     if (!json_string(welcome, "session_id", &session) || session[0] == '\0' ||
         strnlen(session, TURN_ID_MAX_BYTES + 1) > TURN_ID_MAX_BYTES || !cJSON_IsObject(version) ||
-        !json_integer(version, "major", &major) || major != 2 ||
-        !json_integer(version, "minor", &minor) || minor != 1 ||
+         !json_integer(version, "major", &major) || major != 2 ||
+         !json_integer(version, "minor", &minor) || (minor != 1 && minor != 2) ||
         !json_integer(welcome, "heartbeat_interval_ms", &heartbeat_interval) ||
         heartbeat_interval < HEARTBEAT_MIN_MS || heartbeat_interval > HEARTBEAT_MAX_MS ||
         !validate_audio_contract(welcome)) {
@@ -218,7 +291,24 @@ static bool validate_welcome(const cJSON *welcome)
     if (esp_timer_start_periodic(heartbeat_timer, (uint64_t)heartbeat_interval * 1000ULL) != ESP_OK) {
         return false;
     }
+    if (recovery_pending && minor != 2) {
+        // A v1 server cannot honour a resume request; never replay stale PCM.
+        clear_recovery_state();
+        assistant_state = SATELLITE_ASSISTANT_IDLE;
+        satellite_audio_reset();
+        satellite_ui_post_assistant_state(assistant_state);
+    }
+    strlcpy(session_id, session, sizeof(session_id));
+    protocol_minor = minor;
     protocol_ready = true;
+    if (recovery_pending) {
+        expected_downlink_sequence = last_played_sequence_valid ? last_played_sequence + 1 : 0;
+        satellite_audio_begin_playback();
+        recovery_pending = false;
+        if (recovery_timer != NULL && esp_timer_is_active(recovery_timer)) {
+            esp_timer_stop(recovery_timer);
+        }
+    }
     if (satellite_audio_enable_aec() != ESP_OK) {
         ESP_LOGE(TAG, "AEC activation failed; remaining in half-duplex mode");
     }
@@ -229,6 +319,26 @@ static void reset_downlink_payload(void)
 {
     downlink_payload_bytes = 0;
     downlink_payload_length = 0;
+}
+
+static bool validate_tts_audio(const cJSON *message)
+{
+    const char *turn_id;
+    int sequence;
+    int bytes;
+
+    if (!json_string(message, "turn_id", &turn_id) || !json_integer(message, "seq", &sequence) ||
+        !json_integer(message, "bytes", &bytes) || sequence < 0 || bytes <= 0 ||
+        bytes > DOWNLINK_MAX_BYTES || (bytes % sizeof(int16_t)) != 0 ||
+        assistant_state != SATELLITE_ASSISTANT_SPEAKING || strcmp(turn_id, active_turn_id) != 0 ||
+        (uint32_t)sequence != expected_downlink_sequence) {
+        return false;
+    }
+    tts_audio_pending = true;
+    tts_audio_bytes = (size_t)bytes;
+    tts_audio_sequence = (uint32_t)sequence;
+    expected_downlink_sequence++;
+    return true;
 }
 
 static bool assistant_accepts_downlink(void)
@@ -243,6 +353,12 @@ static void handle_binary_message(esp_websocket_client_handle_t websocket,
     if (!protocol_ready || event->data_len <= 0 || event->payload_len <= 0 ||
         event->payload_len > DOWNLINK_MAX_BYTES || (event->payload_len % sizeof(int16_t)) != 0) {
         protocol_violation(websocket);
+        discard_tts_audio_pending();
+        reset_downlink_payload();
+        return;
+    }
+    if (protocol_minor == 2 && !tts_audio_pending) {
+        protocol_violation(websocket);
         reset_downlink_payload();
         return;
     }
@@ -252,17 +368,26 @@ static void handle_binary_message(esp_websocket_client_handle_t websocket,
     const size_t payload_len = (size_t)event->payload_len;
     if (payload_offset > payload_len || data_len > payload_len - payload_offset) {
         protocol_violation(websocket);
+        discard_tts_audio_pending();
         reset_downlink_payload();
         return;
     }
 
+    if (tts_audio_pending && payload_len != tts_audio_bytes) {
+        protocol_violation(websocket);
+        discard_tts_audio_pending();
+        reset_downlink_payload();
+        return;
+    }
     if (payload_len == data_len && payload_offset == 0) {
         if (assistant_accepts_downlink()) {
-            satellite_audio_enqueue_downlink((const int16_t *)event->data_ptr, data_len / sizeof(int16_t));
+            satellite_audio_enqueue_downlink((const int16_t *)event->data_ptr, data_len / sizeof(int16_t),
+                                             tts_audio_pending, tts_audio_sequence);
             if (idle_pending) {
                 schedule_idle_completion(IDLE_DRAIN_MS);
             }
         }
+        clear_tts_audio_pending();
         reset_downlink_payload();
         return;
     }
@@ -273,6 +398,7 @@ static void handle_binary_message(esp_websocket_client_handle_t websocket,
     }
     if (downlink_payload_length != payload_len || downlink_payload_bytes != payload_offset) {
         protocol_violation(websocket);
+        discard_tts_audio_pending();
         reset_downlink_payload();
         return;
     }
@@ -284,15 +410,18 @@ static void handle_binary_message(esp_websocket_client_handle_t websocket,
     }
     if (downlink_payload_bytes != downlink_payload_length) {
         protocol_violation(websocket);
+        discard_tts_audio_pending();
         reset_downlink_payload();
         return;
     }
     if (assistant_accepts_downlink()) {
-        satellite_audio_enqueue_downlink(downlink_payload_samples, downlink_payload_bytes / sizeof(int16_t));
+        satellite_audio_enqueue_downlink(downlink_payload_samples, downlink_payload_bytes / sizeof(int16_t),
+                                         tts_audio_pending, tts_audio_sequence);
         if (idle_pending) {
             schedule_idle_completion(IDLE_DRAIN_MS);
         }
     }
+    clear_tts_audio_pending();
     reset_downlink_payload();
 }
 
@@ -303,6 +432,7 @@ static bool validate_assistant_state(const cJSON *message)
     const bool was_speaking = assistant_state == SATELLITE_ASSISTANT_SPEAKING;
     bool replaces_follow_up_turn;
     bool replaces_barge_in_turn;
+    bool starts_proactive_turn;
 
     if (!json_string(message, "state", &state)) {
         return false;
@@ -340,17 +470,20 @@ static bool validate_assistant_state(const cJSON *message)
     // A spoken follow-up starts a new server turn before the previous
     // follow-up window expires, so it legitimately carries a new turn ID.
     replaces_follow_up_turn = assistant_state == SATELLITE_ASSISTANT_FOLLOW_UP &&
-                              strcmp(active_turn_id, turn_id->valuestring) != 0;
+                               strcmp(active_turn_id, turn_id->valuestring) != 0;
     replaces_barge_in_turn = barge_in_turn_pending &&
-                             (strcmp(state, "wake_detected") == 0 || strcmp(state, "listening") == 0) &&
-                             strcmp(active_turn_id, turn_id->valuestring) != 0;
+                              (strcmp(state, "wake_detected") == 0 || strcmp(state, "listening") == 0) &&
+                              strcmp(active_turn_id, turn_id->valuestring) != 0;
+    // Server-initiated announcements start directly at speaking, without a
+    // wake/listen/thinking sequence from this satellite.
+    starts_proactive_turn = strcmp(state, "speaking") == 0 && active_turn_id[0] == '\0';
     if (strcmp(state, "wake_detected") == 0) {
         if (active_turn_id[0] != '\0' && !replaces_follow_up_turn && !replaces_barge_in_turn) {
             return false;
         }
-    } else if (active_turn_id[0] == '\0' ||
+    } else if ((!starts_proactive_turn && active_turn_id[0] == '\0') ||
                (strcmp(active_turn_id, turn_id->valuestring) != 0 && !replaces_follow_up_turn &&
-                !replaces_barge_in_turn)) {
+                 !replaces_barge_in_turn && !starts_proactive_turn)) {
         return false;
     }
     if (replaces_follow_up_turn) {
@@ -361,6 +494,11 @@ static bool validate_assistant_state(const cJSON *message)
         esp_timer_stop(idle_drain_timer);
     }
     memcpy(active_turn_id, turn_id->valuestring, strlen(turn_id->valuestring) + 1);
+    if (strcmp(state, "speaking") == 0 && !was_speaking) {
+        expected_downlink_sequence = 0;
+        last_played_sequence_valid = false;
+        clear_tts_audio_pending();
+    }
     barge_in_turn_pending = false;
     if (strcmp(state, "wake_detected") == 0) {
         assistant_state = SATELLITE_ASSISTANT_WAKE_DETECTED;
@@ -395,6 +533,11 @@ static bool validate_tts_cancel(const cJSON *message)
            strcmp(active_turn_id, turn_id) == 0 && assistant_state == SATELLITE_ASSISTANT_SPEAKING;
 }
 
+static bool validate_tts_end(const cJSON *message)
+{
+    return validate_tts_cancel(message);
+}
+
 static bool handle_control_message(esp_websocket_client_handle_t websocket, const char *data, size_t length)
 {
     cJSON *message = cJSON_ParseWithLength(data, length);
@@ -405,7 +548,14 @@ static bool handle_control_message(esp_websocket_client_handle_t websocket, cons
         ESP_LOGI(TAG, "Received server control message: %s", type);
         if (!protocol_ready) {
             valid = strcmp(type, "satellite.welcome") == 0 && validate_welcome(message);
+        } else if (tts_audio_pending) {
+            // tts.audio is a one-message header for the binary frame that follows.
+            discard_tts_audio_pending();
+            valid = false;
+        } else if (strcmp(type, "tts.audio") == 0) {
+            valid = validate_tts_audio(message);
         } else if (strcmp(type, "assistant.state") == 0) {
+            clear_tts_audio_pending();
             valid = validate_assistant_state(message);
             if (valid) {
                 satellite_ui_post_assistant_state(assistant_state);
@@ -416,7 +566,15 @@ static bool handle_control_message(esp_websocket_client_handle_t websocket, cons
                 barge_in_turn_pending = true;
                 satellite_audio_cancel_playback();
             }
+        } else if (strcmp(type, "tts.end") == 0) {
+            valid = validate_tts_end(message);
+            if (valid) {
+                // Keep the speaker active until the queued I2S PCM drains.
+                idle_pending = true;
+                schedule_idle_completion(IDLE_DRAIN_MS);
+            }
         } else if (strcmp(type, "satellite.heartbeat") == 0) {
+            heartbeat_acknowledgements++;
             valid = true;
         } else if (strcmp(type, "conversation_mode.changed") == 0 ||
                    strcmp(type, "conversation.transcript") == 0 ||
@@ -444,6 +602,12 @@ esp_err_t satellite_protocol_init(void)
     if (error != ESP_OK) {
         return error;
     }
+    if (downlink_payload_samples == NULL) {
+        downlink_payload_samples = heap_caps_malloc(DOWNLINK_MAX_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (downlink_payload_samples == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
     websocket_send_lock = xSemaphoreCreateMutex();
     if (websocket_send_lock == NULL) {
         return ESP_ERR_NO_MEM;
@@ -459,6 +623,12 @@ esp_err_t satellite_protocol_init(void)
     };
     ESP_RETURN_ON_ERROR(esp_timer_create(&idle_timer_config, &idle_drain_timer), TAG,
                         "Idle drain timer creation failed");
+    const esp_timer_create_args_t recovery_timer_config = {
+        .callback = recovery_timer_callback,
+        .name = "tts_recovery",
+    };
+    ESP_RETURN_ON_ERROR(esp_timer_create(&recovery_timer_config, &recovery_timer), TAG,
+                        "TTS recovery timer creation failed");
     return ESP_OK;
 }
 
@@ -473,9 +643,12 @@ void satellite_protocol_reset(void)
     protocol_ready = false;
     uplink_frames_sent = 0;
     last_uplink_send_us = 0;
+    heartbeat_acknowledgements = 0;
+    observed_heartbeat_acknowledgements = 0;
+    unacknowledged_health_reports = 0;
     reset_downlink_payload();
     protocol_websocket = NULL;
-    active_turn_id[0] = '\0';
+    clear_recovery_state();
     stop_pending = false;
     idle_pending = false;
     barge_in_turn_pending = false;
@@ -486,6 +659,39 @@ void satellite_protocol_reset(void)
     if (idle_drain_timer != NULL && esp_timer_is_active(idle_drain_timer)) {
         esp_timer_stop(idle_drain_timer);
     }
+}
+
+void satellite_protocol_disconnected(void)
+{
+    const bool can_recover = protocol_ready && session_id[0] != '\0' && active_turn_id[0] != '\0' &&
+                             assistant_state == SATELLITE_ASSISTANT_SPEAKING;
+    protocol_ready = false;
+    protocol_websocket = NULL;
+    reset_downlink_payload();
+    clear_tts_audio_pending();
+    observed_heartbeat_acknowledgements = heartbeat_acknowledgements;
+    unacknowledged_health_reports = 0;
+    if (heartbeat_timer != NULL && esp_timer_is_active(heartbeat_timer)) {
+        esp_timer_stop(heartbeat_timer);
+    }
+    if (!can_recover) {
+        satellite_protocol_reset();
+        satellite_audio_reset();
+        return;
+    }
+    recovery_pending = true;
+    // Queued PCM may overlap the server's resumed stream, so discard it before reconnecting.
+    satellite_audio_cancel_playback();
+    ESP_LOGW(TAG, "Preserving TTS turn %s through a %u ms reconnect window", active_turn_id,
+             TTS_RECOVERY_WINDOW_MS);
+    if (esp_timer_start_once(recovery_timer, TTS_RECOVERY_WINDOW_MS * 1000ULL) != ESP_OK) {
+        recovery_timer_callback(NULL);
+    }
+}
+
+bool satellite_protocol_recovery_pending(void)
+{
+    return recovery_pending;
 }
 
 bool satellite_protocol_connected(esp_websocket_client_handle_t websocket)
@@ -508,7 +714,7 @@ bool satellite_protocol_connected(esp_websocket_client_handle_t websocket)
     cJSON_AddStringToObject(hello, "token", device_token);
     cJSON_AddStringToObject(version, "name", "satellite-v2");
     cJSON_AddNumberToObject(version, "major", 2);
-    cJSON_AddNumberToObject(version, "minor", 1);
+    cJSON_AddNumberToObject(version, "minor", 2);
     cJSON_AddStringToObject(device, "id", device_id);
     cJSON_AddStringToObject(device, "name", device_name);
     cJSON_AddStringToObject(device, "firmware", "0.1.0");
@@ -521,6 +727,16 @@ bool satellite_protocol_connected(esp_websocket_client_handle_t websocket)
     cJSON_AddStringToObject(capabilities, "presence_indicator", "display_glow");
     cJSON_AddBoolToObject(capabilities, "conversation_ui", true);
     cJSON_AddBoolToObject(capabilities, "ota", false);
+    if (recovery_pending) {
+        cJSON *resume = cJSON_AddObjectToObject(hello, "resume");
+        if (resume == NULL) {
+            cJSON_Delete(hello);
+            return false;
+        }
+        cJSON_AddStringToObject(resume, "session_id", session_id);
+        cJSON_AddStringToObject(resume, "turn_id", active_turn_id);
+        cJSON_AddNumberToObject(resume, "next_seq", last_played_sequence_valid ? last_played_sequence + 1 : 0);
+    }
     serialized = cJSON_PrintUnformatted(hello);
     cJSON_Delete(hello);
     if (serialized == NULL || strlen(serialized) > CONTROL_MESSAGE_MAX_BYTES) {
@@ -627,8 +843,17 @@ esp_err_t satellite_protocol_send_stop(void)
         esp_timer_stop(idle_drain_timer);
     }
     reset_downlink_payload();
+    clear_recovery_state();
     satellite_audio_reset();
     assistant_state = SATELLITE_ASSISTANT_IDLE;
     satellite_ui_post_assistant_state(assistant_state);
     return sent ? ESP_OK : ESP_FAIL;
+}
+
+void satellite_protocol_playback_frame_completed(uint32_t sequence)
+{
+    if (protocol_ready || recovery_pending) {
+        last_played_sequence = sequence;
+        last_played_sequence_valid = true;
+    }
 }

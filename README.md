@@ -45,26 +45,25 @@ Replace every example value before flashing. In particular:
   Fulloch server.
 - Set `audio.speaker_volume_percent` from 0 to 100. This controls the ES8311
   codec output level.
-- Leave `audio.aec_enabled` enabled for normal full-duplex operation. Disable
-  it only for connection or audio-capture diagnostics.
-- To use Spotify controls, set `spotify.enabled` and add the Spotify client
-  credentials. Controls apply to Spotify's currently active device. The refresh
-  token needs `user-modify-playback-state` and `user-read-playback-state`
-  scopes, and the account requires Spotify Premium.
+- Leave `audio.aec_enabled` enabled to reduce speaker feedback.
+- Select the music source with `music.player`. Options are `spotify` or `sonos` currently. If using Spotify controls, set `music.player` to `spotify` and add the Spotify client credentials to the json. Requires Spotify Premium. If you are using a Sonos speaker, set it to `sonos` and set `sonos.host` to the IP address of the Sonos speaker to control.
 
-The firmware does not verify the server certificate for its local-network
-WebSocket connection. Traffic remains encrypted, but this connection is
-susceptible to a network man-in-the-middle attack. The Spotify client separately
-uses the public CA bundle to verify Spotify HTTPS connections.
+The example json is a valid Spotify configuration. To use Sonos, replace
+its `music` and `spotify` sections with the following, and remove the
+`spotify` section from the credentials file:
 
-The private bundle files and generated NVS image are ignored by Git. They are a
-development provisioning method, not encrypted production storage. Device
-bundles do not accept TLS certificates or private keys.
+```json
+"music": {
+  "player": "sonos"
+},
+"sonos": {
+  "host": "192.168.1.50"
+}
+```
 
 ### 3. Build And Flash
 
-Connect the board with a data-capable USB cable. Identify the serial port, then
-build and flash with the relevant port substituted for `<port>`:
+Connect the board with a data-capable USB cable. Identify the serial port, then build and flash with the relevant port substituted for `<port>`:
 
 ```sh
 idf.py -B build/touch-lcd-rev2 \
@@ -89,29 +88,7 @@ Exit the monitor with `Ctrl+]`.
 ### 4. Confirm Startup
 
 The display progresses through audio and network status messages while the
-board initializes. In the serial monitor, verify that Wi-Fi connects, the
-WebSocket transport connects, and the server accepts the satellite handshake.
-The device then streams microphone PCM uplink and plays accepted server PCM
-downlink. Tap the screen while idle to see date and time and a small light symbol indicating connection state. Swipe either direction to change screen to Spotify music controls.
+board initializes. Tap the screen while idle to see date and time and a small led icon indicating connection state. Swipe either direction to change screen to music controls for the selected player.
 
 During a server-driven voice turn, the display shows layered pulsing circles
-from wake detection through follow-up listening. A tap on the pulsing rings during an active voice turn sends a stop message,
-clears queued audio, and returns the device to idle.
-
-## Network Recovery
-
-The satellite connects as a Wi-Fi station and uses the provisioned `wss://`
-server URL. Wi-Fi and server transport retries use a bounded one- to 60-second
-exponential backoff. Connection logs deliberately omit Wi-Fi credentials,
-device tokens, and server URLs.
-
-The clock uses SNTP after Wi-Fi connects and remains available if the server is
-unavailable. Spotify controls connect directly to Spotify over HTTPS and do not
-depend on the satellite WebSocket connection.
-
-## Releases
-
-Version tags publish the bootloader, partition table, OTA data, application
-image, and checksums as GitHub release assets. Release assets do not include
-`nvs.bin`; provision and flash each device's NVS partition locally before first
-use.
+from wake detection through follow-up listening. A tap on the pulsing rings during an active voice turn sends a stop message, clears queued audio, and returns the device to idle.

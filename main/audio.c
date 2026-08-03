@@ -39,6 +39,8 @@ typedef struct {
 
 typedef struct {
     uint32_t generation;
+    bool sequenced;
+    uint32_t sequence;
     size_t sample_count;
     int16_t samples[DOWNLINK_MAX_SAMPLES];
 } downlink_frame_t;
@@ -303,8 +305,11 @@ static void downlink_playback_task(void *argument)
             }
             const int64_t write_started_us = esp_timer_get_time();
             if (waveshare_touch_lcd_185c_play_mono_s16le(downlink_input->samples,
-                                                         downlink_input->sample_count) != ESP_OK) {
+                                                          downlink_input->sample_count) != ESP_OK) {
                 metrics.playback_underruns++;
+            } else if (downlink_input->sequenced) {
+                // Only acknowledge a sequence once all of its PCM reached I2S.
+                satellite_protocol_playback_frame_completed(downlink_input->sequence);
             }
             const int64_t write_duration_us = esp_timer_get_time() - write_started_us;
             playback_write_total_us += write_duration_us;
@@ -447,6 +452,15 @@ void satellite_audio_cancel_playback(void)
     playback_active = false;
 }
 
+void satellite_audio_finish_playback(void)
+{
+    // Called only after the downlink queue and I2S path have drained. Unlike a
+    // cancel, preserve queued audio until it has completed before powering down.
+    waveshare_touch_lcd_185c_stop_playback();
+    satellite_audio_log_playback_diagnostics();
+    playback_active = false;
+}
+
 void satellite_audio_begin_playback(void)
 {
     reset_playback_diagnostics();
@@ -470,7 +484,8 @@ void satellite_audio_log_playback_diagnostics(void)
              playback_chunks_written, average_write_us, playback_write_max_us);
 }
 
-bool satellite_audio_enqueue_downlink(const int16_t *samples, size_t sample_count)
+bool satellite_audio_enqueue_downlink(const int16_t *samples, size_t sample_count,
+                                      bool sequenced, uint32_t sequence)
 {
     if (downlink_queue == NULL || downlink_free_queue == NULL || samples == NULL || sample_count == 0 ||
         sample_count > DOWNLINK_MAX_SAMPLES) {
@@ -482,6 +497,8 @@ bool satellite_audio_enqueue_downlink(const int16_t *samples, size_t sample_coun
         return false;
     }
     frame->generation = playback_generation;
+    frame->sequenced = sequenced;
+    frame->sequence = sequence;
     frame->sample_count = sample_count;
     memcpy(frame->samples, samples, sample_count * sizeof(*samples));
     const int64_t now_us = esp_timer_get_time();
@@ -496,18 +513,18 @@ bool satellite_audio_enqueue_downlink(const int16_t *samples, size_t sample_coun
     }
     last_downlink_received_us = now_us;
     downlink_samples_received += sample_count;
-    int16_t minimum = frame->samples[0];
-    int16_t maximum = frame->samples[0];
-    for (size_t sample = 1; sample < sample_count; ++sample) {
-        if (frame->samples[sample] < minimum) {
-            minimum = frame->samples[sample];
-        }
-        if (frame->samples[sample] > maximum) {
-            maximum = frame->samples[sample];
-        }
-    }
     downlink_chunks_received++;
     if (downlink_chunks_received <= 8) {
+        int16_t minimum = frame->samples[0];
+        int16_t maximum = frame->samples[0];
+        for (size_t sample = 1; sample < sample_count; ++sample) {
+            if (frame->samples[sample] < minimum) {
+                minimum = frame->samples[sample];
+            }
+            if (frame->samples[sample] > maximum) {
+                maximum = frame->samples[sample];
+            }
+        }
         ESP_LOGI("audio", "Received downlink chunk %lu: %u samples, range=%d..%d",
                  (unsigned long)downlink_chunks_received, (unsigned int)sample_count, minimum, maximum);
     }

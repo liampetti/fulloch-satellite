@@ -10,11 +10,12 @@
 #include "esp_timer.h"
 #include "fulloch_sat_logo.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "lvgl.h"
 #include "protocol.h"
-#include "spotify.h"
+#include "music.h"
 #include "ui.h"
 #include "waveshare_touch_lcd_185c.h"
 
@@ -141,11 +142,11 @@ static void set_music_visible(bool visible)
 
 static void handle_music_control(lv_event_t *event)
 {
-    satellite_spotify_request((satellite_spotify_command_t)(uintptr_t)lv_event_get_user_data(event));
+    satellite_music_request((satellite_music_command_t)(uintptr_t)lv_event_get_user_data(event));
 }
 
 static void create_music_control(lv_obj_t *parent, lv_coord_t x, lv_coord_t size, const char *icon,
-                                 bool primary, satellite_spotify_command_t command)
+                                 bool primary, satellite_music_command_t command)
 {
     lv_obj_t *button = lv_btn_create(parent);
     lv_obj_clear_flag(button, LV_OBJ_FLAG_SCROLLABLE);
@@ -168,7 +169,7 @@ static void create_music_control(lv_obj_t *parent, lv_coord_t x, lv_coord_t size
     lv_obj_set_style_text_color(icon_label, primary ? lv_color_hex(0x052e23) : lv_color_hex(0x6ee7b7), 0);
     lv_obj_set_style_text_font(icon_label, &lv_font_montserrat_22, 0);
     lv_obj_center(icon_label);
-    if (command == SATELLITE_SPOTIFY_TOGGLE_PLAYBACK) {
+    if (command == SATELLITE_MUSIC_TOGGLE_PLAYBACK) {
         music_play_icon = icon_label;
     }
 }
@@ -212,7 +213,7 @@ static void show_idle_view(ui_idle_view_t view)
     } else {
         set_datetime_visible(false);
         set_music_visible(true);
-        satellite_spotify_request(SATELLITE_SPOTIFY_REFRESH);
+        satellite_music_request(SATELLITE_MUSIC_REFRESH);
     }
     clock_visible_until = lv_tick_get() + UI_CLOCK_DISPLAY_MS;
 }
@@ -358,9 +359,9 @@ static void setup_lvgl(void)
     lv_obj_set_style_bg_opa(music_controls, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(music_controls, 0, 0);
     lv_obj_set_style_pad_all(music_controls, 0, 0);
-    create_music_control(music_controls, 56, 58, LV_SYMBOL_PREV, false, SATELLITE_SPOTIFY_PREVIOUS);
-    create_music_control(music_controls, 144, 72, LV_SYMBOL_PLAY, true, SATELLITE_SPOTIFY_TOGGLE_PLAYBACK);
-    create_music_control(music_controls, 246, 58, LV_SYMBOL_NEXT, false, SATELLITE_SPOTIFY_NEXT);
+    create_music_control(music_controls, 56, 58, LV_SYMBOL_PREV, false, SATELLITE_MUSIC_PREVIOUS);
+    create_music_control(music_controls, 144, 72, LV_SYMBOL_PLAY, true, SATELLITE_MUSIC_TOGGLE_PLAYBACK);
+    create_music_control(music_controls, 246, 58, LV_SYMBOL_NEXT, false, SATELLITE_MUSIC_NEXT);
     set_datetime_visible(false);
     set_music_visible(false);
 }
@@ -374,8 +375,9 @@ static uint16_t pulse_size(size_t index)
 
 static void render(void)
 {
+    const bool recovering = connection_state == SATELLITE_CONNECTION_RECOVERING;
     const bool active = assistant_state != SATELLITE_ASSISTANT_IDLE &&
-                        assistant_state != SATELLITE_ASSISTANT_ERROR;
+                         assistant_state != SATELLITE_ASSISTANT_ERROR;
     if (idle_view_visible() &&
         (active || assistant_state == SATELLITE_ASSISTANT_ERROR ||
          (int32_t)(lv_tick_get() - clock_visible_until) >= 0)) {
@@ -388,18 +390,20 @@ static void render(void)
     lv_obj_set_style_bg_color(clock_connection_led, connection_led_color, 0);
     lv_obj_set_style_shadow_color(clock_connection_led, connection_led_color, 0);
     for (size_t index = 0; index < 3; ++index) {
-        if (active) {
+        if (active || recovering) {
             lv_obj_clear_flag(rings[index], LV_OBJ_FLAG_HIDDEN);
             const uint16_t size = pulse_size(index);
             lv_obj_set_size(rings[index], size, size);
             lv_obj_center(rings[index]);
-            lv_obj_set_style_border_color(rings[index], lv_color_hex(0x20d99a), 0);
+            lv_obj_set_style_border_color(rings[index],
+                                          recovering ? lv_color_hex(0xef4444) : lv_color_hex(0x20d99a), 0);
         } else {
             lv_obj_add_flag(rings[index], LV_OBJ_FLAG_HIDDEN);
         }
     }
-    if (connection_status_suppressed || idle_view_visible() || active ||
-        (satellite_protocol_ready() && connection_state == SATELLITE_CONNECTION_CONNECTED)) {
+    if (connection_status_suppressed || (!recovering && (idle_view_visible() || active ||
+                                        (satellite_protocol_ready() &&
+                                         connection_state == SATELLITE_CONNECTION_CONNECTED)))) {
         lv_obj_add_flag(status_label, LV_OBJ_FLAG_HIDDEN);
     } else {
         const char *status_text = "Starting";
@@ -413,6 +417,10 @@ static void render(void)
             break;
         case SATELLITE_CONNECTION_SERVER_CONNECTING:
             status_text = "Connecting server";
+            break;
+        case SATELLITE_CONNECTION_RECOVERING:
+            status_text = "Reconnecting";
+            status_color = lv_color_hex(0xef4444);
             break;
         case SATELLITE_CONNECTION_CONNECTED:
             status_text = "Connected";
@@ -460,7 +468,7 @@ static void ui_task(void *argument)
                 }
             }
             if (event.type == UI_EVENT_ALBUM_ART) {
-                const lv_img_dsc_t *album_art = satellite_spotify_album_art();
+                const lv_img_dsc_t *album_art = satellite_music_album_art();
                 const lv_coord_t largest_edge = album_art->header.w > album_art->header.h
                                                     ? album_art->header.w
                                                     : album_art->header.h;
@@ -498,7 +506,8 @@ esp_err_t satellite_ui_start(void)
     assistant_events = xQueueCreate(UI_ASSISTANT_EVENT_QUEUE_DEPTH, sizeof(int));
     connection_events = xQueueCreate(UI_CONNECTION_EVENT_QUEUE_DEPTH, sizeof(satellite_connection_status_t));
     if (ui_events == NULL || assistant_events == NULL || connection_events == NULL ||
-        xTaskCreate(ui_task, "ui", 6144, NULL, 4, NULL) != pdPASS) {
+        xTaskCreateWithCaps(ui_task, "ui", 6144, NULL, 4, NULL,
+                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
     const esp_timer_create_args_t tick_timer_config = {

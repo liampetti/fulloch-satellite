@@ -13,7 +13,7 @@ from typing import Any
 WELCOME = {
     "type": "satellite.welcome",
     "session_id": "fixture-session",
-    "protocol": {"major": 2, "minor": 1},
+    "protocol": {"major": 2, "minor": 2},
     "audio": {
         "uplink": {"encoding": "pcm_s16le", "sample_rate_hz": 16000, "channels": 1, "frame_duration_ms": 20},
         "downlink": {"encoding": "pcm_s16le", "sample_rate_hz": 16000, "channels": 1},
@@ -26,15 +26,23 @@ def validate_hello(message: dict[str, Any]) -> bool:
     protocol = message.get("protocol")
     device = message.get("device")
     capabilities = message.get("capabilities")
+    resume = message.get("resume")
+    resume_valid = resume is None or (
+        isinstance(resume, dict)
+        and all(isinstance(resume.get(field), str) and resume[field] for field in ("session_id", "turn_id"))
+        and isinstance(resume.get("next_seq"), int)
+        and resume["next_seq"] >= 0
+    )
     return (
         message.get("type") == "satellite.hello"
         and isinstance(message.get("token"), str)
         and bool(message["token"])
-        and protocol == {"name": "satellite-v2", "major": 2, "minor": 1}
+        and protocol == {"name": "satellite-v2", "major": 2, "minor": 2}
         and isinstance(device, dict)
         and all(isinstance(device.get(field), str) and device[field] for field in ("id", "name", "firmware", "build", "board"))
         and isinstance(capabilities, dict)
         and all(capabilities.get(field) is True for field in ("audio_input", "audio_output", "display", "touch"))
+        and resume_valid
     )
 
 

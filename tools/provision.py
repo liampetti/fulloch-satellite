@@ -50,14 +50,13 @@ def require_integer(value: object, name: str, minimum: int, maximum: int) -> int
 
 
 def validate(config: dict, credentials: dict) -> list[tuple[str, str, str]]:
-    config_keys = {"schema_version", "device", "server", "audio"}
+    config_keys = {"schema_version", "device", "server", "audio", "music"}
     credential_keys = {"schema_version", "wifi", "fulloch"}
-    require_keys(config, config_keys | ({"spotify"} if "spotify" in config else set()), "config")
+    optional_config_keys = {"sonos"} if "sonos" in config else set()
+    require_keys(config, config_keys | optional_config_keys, "config")
     require_keys(credentials, credential_keys | ({"spotify"} if "spotify" in credentials else set()), "credentials")
     if config["schema_version"] != 1 or credentials["schema_version"] != 1:
         raise BundleError("bundle schema_version must be 1")
-    if ("spotify" in config) != ("spotify" in credentials):
-        raise BundleError("Spotify configuration and credentials must be provided together")
 
     device = config["device"]
     server = config["server"]
@@ -75,13 +74,6 @@ def validate(config: dict, credentials: dict) -> list[tuple[str, str, str]]:
             raise BundleError(f"{name} must be an object")
         require_keys(value, keys, name)
 
-    if "spotify" in config:
-        spotify = config["spotify"]
-        if not isinstance(spotify, dict):
-            raise BundleError("spotify must be an object")
-        require_keys(spotify, {"enabled"}, "spotify")
-        if not isinstance(spotify["enabled"], bool):
-            raise BundleError("spotify.enabled must be a boolean")
     if "spotify" in credentials:
         spotify_credentials = credentials["spotify"]
         if not isinstance(spotify_credentials, dict):
@@ -90,6 +82,22 @@ def validate(config: dict, credentials: dict) -> list[tuple[str, str, str]]:
         require_string(spotify_credentials["client_id"], "spotify.client_id", 256)
         require_string(spotify_credentials["client_secret"], "spotify.client_secret", 256)
         require_string(spotify_credentials["refresh_token"], "spotify.refresh_token", 512)
+    music = config["music"]
+    if not isinstance(music, dict):
+        raise BundleError("music must be an object")
+    require_keys(music, {"player"}, "music")
+    if music["player"] not in {"spotify", "sonos"}:
+        raise BundleError("music.player must be spotify or sonos")
+    if ("sonos" in config) != ("music" in config and config["music"]["player"] == "sonos"):
+        raise BundleError("sonos configuration requires music.player set to sonos")
+    if ("spotify" in credentials) != (music["player"] == "spotify"):
+        raise BundleError("Spotify credentials require music.player set to spotify")
+    if "sonos" in config:
+        sonos = config["sonos"]
+        if not isinstance(sonos, dict):
+            raise BundleError("sonos must be an object")
+        require_keys(sonos, {"host"}, "sonos")
+        require_string(sonos["host"], "sonos.host", 63)
 
     server_url = require_string(server["url"], "server.url", 256)
     parsed_url = urlsplit(server_url)
@@ -109,13 +117,16 @@ def validate(config: dict, credentials: dict) -> list[tuple[str, str, str]]:
         ("wifi", "password", require_string(wifi["password"], "wifi.password", 63)),
         ("fulloch", "device_token", require_string(fulloch["device_token"], "fulloch.device_token", 256)),
     ]
-    if "spotify" in config and "spotify" in credentials:
+    if "spotify" in credentials:
         values.extend([
-            ("spotify", "enabled", str(spotify["enabled"]).lower()),
             ("spotify", "client_id", spotify_credentials["client_id"]),
             ("spotify", "client_secret", spotify_credentials["client_secret"]),
             ("spotify", "refresh_token", spotify_credentials["refresh_token"]),
         ])
+    if "music" in config:
+        values.append(("music", "player", config["music"]["player"]))
+    if "sonos" in config:
+        values.append(("sonos", "host", config["sonos"]["host"]))
     return [(namespace, key, value) for namespace, key, value in values]
 
 

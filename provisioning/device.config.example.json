@@ -12,7 +12,7 @@
     "speaker_volume_percent": 65,
     "aec_enabled": true
   },
-  "spotify": {
-    "enabled": true
+  "music": {
+    "player": "spotify"
   }
 }

@@ -9,6 +9,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif_sntp.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_websocket_client.h"
 #include "esp_wifi.h"
@@ -27,12 +28,15 @@
 #define WEBSOCKET_OPCODE_CLOSE 0x8
 #define WEBSOCKET_TASK_STACK_BYTES 8192
 #define WEBSOCKET_NETWORK_TIMEOUT_MS 60000
+#define CONNECTIVITY_CHECK_MS 60000U
+#define CONNECTIVITY_STALL_RESET_MS 600000U
 
 static const char *TAG = "connectivity";
 
 static esp_websocket_client_handle_t websocket;
 static esp_timer_handle_t wifi_reconnect_timer;
 static esp_timer_handle_t websocket_reconnect_timer;
+static esp_timer_handle_t connectivity_check_timer;
 static satellite_connection_status_t connection_status = SATELLITE_CONNECTION_STARTING;
 static bool wifi_ready;
 static bool time_synchronized;
@@ -42,16 +46,15 @@ static uint32_t wifi_backoff_ms = WIFI_RECONNECT_INITIAL_MS;
 static uint32_t websocket_backoff_ms = WEBSOCKET_RECONNECT_INITIAL_MS;
 static uint8_t startup_server_attempts;
 static bool startup_retries_exhausted;
+static bool websocket_stop_pending;
+static int64_t connectivity_unhealthy_since_us;
 static char wifi_ssid[33];
 static char wifi_password[64];
 static char server_url[257];
 static char timezone[65];
 
-/* These fields and the reset point keep reconnects from inheriting a stale turn. */
-static char session_id[65];
-static char active_turn_id[65];
-
 static void schedule_websocket_reconnect(void);
+static void reconnect_from_websocket_event(bool stop_client);
 
 static uint32_t next_backoff(uint32_t current)
 {
@@ -60,8 +63,6 @@ static uint32_t next_backoff(uint32_t current)
 
 static void reset_connection_state(void)
 {
-    session_id[0] = '\0';
-    active_turn_id[0] = '\0';
     satellite_protocol_reset();
     satellite_audio_reset();
 }
@@ -83,8 +84,9 @@ void satellite_connectivity_reconnect(void)
         return;
     }
     websocket_started = false;
-    reset_connection_state();
-    set_status(SATELLITE_CONNECTION_SERVER_CONNECTING);
+    satellite_protocol_disconnected();
+    set_status(satellite_protocol_recovery_pending() ? SATELLITE_CONNECTION_RECOVERING
+                                                      : SATELLITE_CONNECTION_SERVER_CONNECTING);
     if (websocket != NULL) {
         (void)esp_websocket_client_stop(websocket);
     }
@@ -151,7 +153,8 @@ static void schedule_wifi_reconnect(void)
     if (esp_timer_is_active(wifi_reconnect_timer)) {
         return;
     }
-    set_status(SATELLITE_CONNECTION_WIFI_CONNECTING);
+    set_status(satellite_protocol_recovery_pending() ? SATELLITE_CONNECTION_RECOVERING
+                                                      : SATELLITE_CONNECTION_WIFI_CONNECTING);
     ESP_LOGW(TAG, "Wi-Fi unavailable; retrying in %lu ms", (unsigned long)wifi_backoff_ms);
     ESP_ERROR_CHECK(esp_timer_start_once(wifi_reconnect_timer, wifi_backoff_ms * 1000ULL));
     wifi_backoff_ms = next_backoff(wifi_backoff_ms);
@@ -170,7 +173,9 @@ static void schedule_websocket_reconnect(void)
         ESP_ERROR_CHECK(esp_timer_start_once(websocket_reconnect_timer, SERVER_RECHECK_MS * 1000ULL));
         return;
     }
-    set_status(SATELLITE_CONNECTION_SERVER_CONNECTING);
+    if (!satellite_protocol_recovery_pending()) {
+        set_status(SATELLITE_CONNECTION_SERVER_CONNECTING);
+    }
     const uint32_t retry_ms = startup_retries_exhausted ? SERVER_RECHECK_MS : websocket_backoff_ms;
     ESP_LOGW(TAG, "Secure server unavailable; retrying in %lu ms", (unsigned long)retry_ms);
     ESP_ERROR_CHECK(esp_timer_start_once(websocket_reconnect_timer, retry_ms * 1000ULL));
@@ -193,18 +198,62 @@ static void websocket_reconnect_timer_callback(void *argument)
     if (!wifi_ready || websocket_started) {
         return;
     }
-    reset_connection_state();
+    if (websocket_stop_pending) {
+        websocket_stop_pending = false;
+        if (esp_websocket_client_stop(websocket) != ESP_OK) {
+            ESP_LOGW(TAG, "Unable to stop failed WebSocket connection");
+        }
+        schedule_websocket_reconnect();
+        return;
+    }
     if (!startup_retries_exhausted) {
         startup_server_attempts++;
     }
     if (esp_websocket_client_start(websocket) == ESP_OK) {
         websocket_started = true;
-        set_status(SATELLITE_CONNECTION_SERVER_CONNECTING);
+        set_status(satellite_protocol_recovery_pending() ? SATELLITE_CONNECTION_RECOVERING
+                                                          : SATELLITE_CONNECTION_SERVER_CONNECTING);
         ESP_LOGI(TAG, "Connecting to local secure server");
     } else {
         set_status(SATELLITE_CONNECTION_ERROR);
         schedule_websocket_reconnect();
     }
+}
+
+static void reconnect_from_websocket_event(bool stop_client)
+{
+    if (!websocket_started) {
+        return;
+    }
+    websocket_started = false;
+    websocket_stop_pending = stop_client;
+    satellite_protocol_disconnected();
+    set_status(satellite_protocol_recovery_pending() ? SATELLITE_CONNECTION_RECOVERING
+                                                      : SATELLITE_CONNECTION_SERVER_CONNECTING);
+    if (wifi_ready) {
+        schedule_websocket_reconnect();
+    }
+}
+
+static void connectivity_check_timer_callback(void *argument)
+{
+    (void)argument;
+    if (wifi_ready && satellite_protocol_ready()) {
+        connectivity_unhealthy_since_us = 0;
+        return;
+    }
+
+    const int64_t now_us = esp_timer_get_time();
+    if (connectivity_unhealthy_since_us == 0) {
+        connectivity_unhealthy_since_us = now_us;
+        return;
+    }
+    if (now_us - connectivity_unhealthy_since_us < (int64_t)CONNECTIVITY_STALL_RESET_MS * 1000LL) {
+        return;
+    }
+
+    ESP_LOGE(TAG, "Connectivity did not recover within %u ms; restarting", CONNECTIVITY_STALL_RESET_MS);
+    esp_restart();
 }
 
 static void time_sync_task(void *argument)
@@ -244,7 +293,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
             ESP_LOGI(TAG, "Secure server connection established; awaiting protocol welcome");
         } else {
             set_status(SATELLITE_CONNECTION_ERROR);
-            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_websocket_client_stop(websocket));
+            reconnect_from_websocket_event(true);
         }
     } else if (event_id == WEBSOCKET_EVENT_DATA) {
         if (event != NULL && event->op_code == WEBSOCKET_OPCODE_CLOSE) {
@@ -273,12 +322,15 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         } else {
             ESP_LOGW(TAG, "Secure server transport closed unexpectedly");
         }
-        satellite_connectivity_reconnect();
+        reconnect_from_websocket_event(false);
     } else if (event_id == WEBSOCKET_EVENT_DISCONNECTED) {
         if (event != NULL && event->close_status_code != 0) {
             ESP_LOGW(TAG, "Secure server closed WebSocket with status %d", event->close_status_code);
         }
-        satellite_connectivity_reconnect();
+        reconnect_from_websocket_event(false);
+    } else if (event_id == WEBSOCKET_EVENT_CLOSED) {
+        ESP_LOGW(TAG, "Secure server closed WebSocket cleanly");
+        reconnect_from_websocket_event(false);
     }
 }
 
@@ -290,16 +342,19 @@ static void wifi_event_handler(void *argument, esp_event_base_t base, int32_t ev
         schedule_wifi_reconnect();
     } else if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_ready = false;
-        reset_connection_state();
         if (websocket_started) {
+            satellite_protocol_disconnected();
             ESP_ERROR_CHECK_WITHOUT_ABORT(esp_websocket_client_stop(websocket));
             websocket_started = false;
+        } else {
+            reset_connection_state();
         }
         schedule_wifi_reconnect();
     } else if (base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         wifi_ready = true;
         wifi_backoff_ms = WIFI_RECONNECT_INITIAL_MS;
-        set_status(SATELLITE_CONNECTION_WIFI_READY);
+        set_status(satellite_protocol_recovery_pending() ? SATELLITE_CONNECTION_RECOVERING
+                                                          : SATELLITE_CONNECTION_WIFI_READY);
         ESP_LOGI(TAG, "Wi-Fi connected");
         schedule_websocket_reconnect();
         if (!time_sync_task_started) {
@@ -360,6 +415,12 @@ esp_err_t satellite_connectivity_start(void)
     };
     ESP_RETURN_ON_ERROR(esp_timer_create(&websocket_timer_config, &websocket_reconnect_timer), TAG,
                         "WebSocket retry timer creation failed");
+    const esp_timer_create_args_t connectivity_check_timer_config = {
+        .callback = connectivity_check_timer_callback,
+        .name = "conn_check",
+    };
+    ESP_RETURN_ON_ERROR(esp_timer_create(&connectivity_check_timer_config, &connectivity_check_timer), TAG,
+                        "Connectivity check timer creation failed");
 
     const esp_websocket_client_config_t websocket_config = {
         .uri = server_url,
@@ -376,6 +437,9 @@ esp_err_t satellite_connectivity_start(void)
     }
     ESP_RETURN_ON_ERROR(esp_websocket_register_events(websocket, WEBSOCKET_EVENT_ANY, websocket_event_handler, NULL), TAG,
                         "WebSocket event registration failed");
+    ESP_RETURN_ON_ERROR(esp_timer_start_periodic(connectivity_check_timer,
+                                                  (uint64_t)CONNECTIVITY_CHECK_MS * 1000ULL),
+                        TAG, "Connectivity check timer start failed");
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "Wi-Fi start failed");
     return ESP_OK;
 }
