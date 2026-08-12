@@ -24,8 +24,15 @@
 #define UI_DRAW_ROWS 10
 #define UI_EVENT_QUEUE_DEPTH 8
 #define UI_ASSISTANT_EVENT_QUEUE_DEPTH 1
+#define UI_ASSISTANT_ACTIVITY_QUEUE_DEPTH 1
+#define UI_FOLLOW_UP_EXPIRY_QUEUE_DEPTH 1
 #define UI_CONNECTION_EVENT_QUEUE_DEPTH 1
 #define UI_CLOCK_DISPLAY_MS 10000
+#define UI_LIFECYCLE_DISPLAY_MS 10000
+#define UI_SPEAKING_START_DISPLAY_MS 15000
+#define UI_SPEAKING_ACTIVITY_DISPLAY_MS 10000
+#define UI_RECOVERY_DISPLAY_MS 2000
+#define UI_BACKLIGHT_ACTIVE_PERCENT 25
 
 typedef enum {
     UI_EVENT_CONNECTION,
@@ -49,6 +56,8 @@ typedef struct {
 static const char *TAG = "ui";
 static QueueHandle_t ui_events;
 static QueueHandle_t assistant_events;
+static QueueHandle_t assistant_activity_events;
+static QueueHandle_t follow_up_expiry_events;
 static QueueHandle_t connection_events;
 static esp_timer_handle_t lvgl_tick_timer;
 static lv_color_t draw_buffer[UI_WIDTH * UI_DRAW_ROWS];
@@ -74,6 +83,11 @@ static ui_idle_view_t idle_view = UI_IDLE_VIEW_DATETIME;
 static bool connection_status_suppressed;
 static satellite_connection_status_t connection_state = SATELLITE_CONNECTION_STARTING;
 static satellite_assistant_state_t assistant_state = SATELLITE_ASSISTANT_IDLE;
+static uint32_t lifecycle_visible_until;
+static uint32_t speaking_visible_until;
+static uint32_t follow_up_visible_until;
+static uint32_t recovery_visible_until;
+static bool backlight_enabled = true;
 
 static void lvgl_tick(void *argument)
 {
@@ -108,6 +122,48 @@ static bool idle_view_visible(void)
 {
     return !lv_obj_has_flag(clock_time_label, LV_OBJ_FLAG_HIDDEN) ||
            !lv_obj_has_flag(music_artwork, LV_OBJ_FLAG_HIDDEN);
+}
+
+static bool display_reason_active(uint32_t visible_until)
+{
+    return visible_until != 0 && (int32_t)(lv_tick_get() - visible_until) < 0;
+}
+
+static void update_assistant_state(int state)
+{
+    assistant_state = state;
+    const uint32_t now = lv_tick_get();
+    switch (assistant_state) {
+    case SATELLITE_ASSISTANT_WAKE_DETECTED:
+    case SATELLITE_ASSISTANT_LISTENING:
+    case SATELLITE_ASSISTANT_THINKING:
+        lifecycle_visible_until = now + UI_LIFECYCLE_DISPLAY_MS;
+        speaking_visible_until = 0;
+        follow_up_visible_until = 0;
+        break;
+    case SATELLITE_ASSISTANT_SPEAKING:
+        lifecycle_visible_until = 0;
+        speaking_visible_until = now + UI_SPEAKING_START_DISPLAY_MS;
+        follow_up_visible_until = 0;
+        break;
+    case SATELLITE_ASSISTANT_FOLLOW_UP:
+        lifecycle_visible_until = 0;
+        speaking_visible_until = 0;
+        break;
+    default:
+        lifecycle_visible_until = 0;
+        speaking_visible_until = 0;
+        follow_up_visible_until = 0;
+        break;
+    }
+}
+
+static bool assistant_display_active(void)
+{
+    return display_reason_active(lifecycle_visible_until) ||
+           display_reason_active(speaking_visible_until) ||
+           (assistant_state == SATELLITE_ASSISTANT_FOLLOW_UP &&
+            display_reason_active(follow_up_visible_until));
 }
 
 static void set_datetime_visible(bool visible)
@@ -203,6 +259,18 @@ static void update_datetime(void)
     lv_label_set_text(clock_date_label, date_text);
 }
 
+static void set_backlight_enabled(bool enabled)
+{
+    if (backlight_enabled == enabled) {
+        return;
+    }
+    if (waveshare_touch_lcd_185c_set_backlight(enabled ? UI_BACKLIGHT_ACTIVE_PERCENT : 0) != ESP_OK) {
+        ESP_LOGW(TAG, "Unable to %s display backlight", enabled ? "enable" : "disable");
+        return;
+    }
+    backlight_enabled = enabled;
+}
+
 static void show_idle_view(ui_idle_view_t view)
 {
     idle_view = view;
@@ -221,7 +289,7 @@ static void show_idle_view(ui_idle_view_t view)
 static void handle_tap(lv_event_t *event)
 {
     (void)event;
-    if (assistant_state == SATELLITE_ASSISTANT_IDLE) {
+    if (!assistant_display_active()) {
         if (!idle_view_visible()) {
             show_idle_view(UI_IDLE_VIEW_DATETIME);
         } else {
@@ -375,9 +443,9 @@ static uint16_t pulse_size(size_t index)
 
 static void render(void)
 {
-    const bool recovering = connection_state == SATELLITE_CONNECTION_RECOVERING;
-    const bool active = assistant_state != SATELLITE_ASSISTANT_IDLE &&
-                         assistant_state != SATELLITE_ASSISTANT_ERROR;
+    const bool recovering = connection_state == SATELLITE_CONNECTION_RECOVERING &&
+                            display_reason_active(recovery_visible_until);
+    const bool active = assistant_display_active();
     if (idle_view_visible() &&
         (active || assistant_state == SATELLITE_ASSISTANT_ERROR ||
          (int32_t)(lv_tick_get() - clock_visible_until) >= 0)) {
@@ -401,9 +469,12 @@ static void render(void)
             lv_obj_add_flag(rings[index], LV_OBJ_FLAG_HIDDEN);
         }
     }
-    if (connection_status_suppressed || (!recovering && (idle_view_visible() || active ||
-                                        (satellite_protocol_ready() &&
-                                         connection_state == SATELLITE_CONNECTION_CONNECTED)))) {
+    const bool status_visible = !connection_status_suppressed &&
+                                (recovering || (!idle_view_visible() && !active &&
+                                 (!satellite_protocol_ready() ||
+                                  connection_state != SATELLITE_CONNECTION_CONNECTED)));
+    set_backlight_enabled(idle_view_visible() || active || status_visible);
+    if (!status_visible) {
         lv_obj_add_flag(status_label, LV_OBJ_FLAG_HIDDEN);
     } else {
         const char *status_text = "Starting";
@@ -446,12 +517,14 @@ static void ui_task(void *argument)
     for (;;) {
         ui_event_t event;
         int assistant_event;
+        int playback_activity;
+        uint32_t follow_up_expiry_ms;
         satellite_connection_status_t connection_event;
         bool show_wake_immediately = false;
         BaseType_t received = xQueueReceive(ui_events, &event, pdMS_TO_TICKS(20));
         while (received == pdPASS) {
             if (event.type == UI_EVENT_ASSISTANT) {
-                assistant_state = event.value;
+                update_assistant_state(event.value);
                 show_wake_immediately |= assistant_state == SATELLITE_ASSISTANT_WAKE_DETECTED;
             }
             if (event.type == UI_EVENT_MUSIC) {
@@ -481,12 +554,22 @@ static void ui_task(void *argument)
             received = xQueueReceive(ui_events, &event, 0);
         }
         while (xQueueReceive(assistant_events, &assistant_event, 0) == pdPASS) {
-            assistant_state = assistant_event;
+            update_assistant_state(assistant_event);
             show_wake_immediately |= assistant_state == SATELLITE_ASSISTANT_WAKE_DETECTED;
+        }
+        while (xQueueReceive(assistant_activity_events, &playback_activity, 0) == pdPASS) {
+            (void)playback_activity;
+            speaking_visible_until = lv_tick_get() + UI_SPEAKING_ACTIVITY_DISPLAY_MS;
+        }
+        while (xQueueReceive(follow_up_expiry_events, &follow_up_expiry_ms, 0) == pdPASS) {
+            follow_up_visible_until = lv_tick_get() + follow_up_expiry_ms;
         }
         while (xQueueReceive(connection_events, &connection_event, 0) == pdPASS) {
             connection_state = connection_event;
             connection_status_suppressed |= connection_state == SATELLITE_CONNECTION_UNAVAILABLE;
+            recovery_visible_until = connection_state == SATELLITE_CONNECTION_RECOVERING
+                                         ? lv_tick_get() + UI_RECOVERY_DISPLAY_MS
+                                         : 0;
         }
         render();
         if (show_wake_immediately) {
@@ -504,8 +587,11 @@ esp_err_t satellite_ui_start(void)
     ESP_RETURN_ON_ERROR(waveshare_touch_lcd_185c_init_display(), TAG, "Display initialization failed");
     ui_events = xQueueCreate(UI_EVENT_QUEUE_DEPTH, sizeof(ui_event_t));
     assistant_events = xQueueCreate(UI_ASSISTANT_EVENT_QUEUE_DEPTH, sizeof(int));
+    assistant_activity_events = xQueueCreate(UI_ASSISTANT_ACTIVITY_QUEUE_DEPTH, sizeof(int));
+    follow_up_expiry_events = xQueueCreate(UI_FOLLOW_UP_EXPIRY_QUEUE_DEPTH, sizeof(uint32_t));
     connection_events = xQueueCreate(UI_CONNECTION_EVENT_QUEUE_DEPTH, sizeof(satellite_connection_status_t));
-    if (ui_events == NULL || assistant_events == NULL || connection_events == NULL ||
+    if (ui_events == NULL || assistant_events == NULL || assistant_activity_events == NULL ||
+        follow_up_expiry_events == NULL || connection_events == NULL ||
         xTaskCreateWithCaps(ui_task, "ui", 6144, NULL, 4, NULL,
                             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) != pdPASS) {
         return ESP_ERR_NO_MEM;
@@ -530,6 +616,21 @@ void satellite_ui_post_assistant_state(int state)
 {
     if (assistant_events != NULL) {
         xQueueOverwrite(assistant_events, &state);
+    }
+}
+
+void satellite_ui_post_playback_activity(void)
+{
+    if (assistant_activity_events != NULL) {
+        const int activity = 1;
+        xQueueOverwrite(assistant_activity_events, &activity);
+    }
+}
+
+void satellite_ui_post_follow_up_expiry(uint32_t duration_ms)
+{
+    if (follow_up_expiry_events != NULL) {
+        xQueueOverwrite(follow_up_expiry_events, &duration_ms);
     }
 }
 

@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <time.h>
 
 #include "cJSON.h"
 #include "audio.h"
@@ -381,8 +382,12 @@ static void handle_binary_message(esp_websocket_client_handle_t websocket,
     }
     if (payload_len == data_len && payload_offset == 0) {
         if (assistant_accepts_downlink()) {
-            satellite_audio_enqueue_downlink((const int16_t *)event->data_ptr, data_len / sizeof(int16_t),
-                                             tts_audio_pending, tts_audio_sequence);
+            if (satellite_audio_enqueue_downlink((const int16_t *)event->data_ptr,
+                                                 data_len / sizeof(int16_t), tts_audio_pending,
+                                                 tts_audio_sequence) &&
+                assistant_state == SATELLITE_ASSISTANT_SPEAKING) {
+                satellite_ui_post_playback_activity();
+            }
             if (idle_pending) {
                 schedule_idle_completion(IDLE_DRAIN_MS);
             }
@@ -415,8 +420,12 @@ static void handle_binary_message(esp_websocket_client_handle_t websocket,
         return;
     }
     if (assistant_accepts_downlink()) {
-        satellite_audio_enqueue_downlink(downlink_payload_samples, downlink_payload_bytes / sizeof(int16_t),
-                                         tts_audio_pending, tts_audio_sequence);
+        if (satellite_audio_enqueue_downlink(downlink_payload_samples,
+                                             downlink_payload_bytes / sizeof(int16_t),
+                                             tts_audio_pending, tts_audio_sequence) &&
+            assistant_state == SATELLITE_ASSISTANT_SPEAKING) {
+            satellite_ui_post_playback_activity();
+        }
         if (idle_pending) {
             schedule_idle_completion(IDLE_DRAIN_MS);
         }
@@ -510,6 +519,13 @@ static bool validate_assistant_state(const cJSON *message)
         assistant_state = SATELLITE_ASSISTANT_SPEAKING;
     } else if (strcmp(state, "follow_up") == 0) {
         assistant_state = SATELLITE_ASSISTANT_FOLLOW_UP;
+        const cJSON *expires_at_ms = cJSON_GetObjectItemCaseSensitive(message, "expires_at_ms");
+        if (cJSON_IsNumber(expires_at_ms) && expires_at_ms->valuedouble > 0) {
+            const int64_t remaining_ms = (int64_t)expires_at_ms->valuedouble - (int64_t)time(NULL) * 1000;
+            satellite_ui_post_follow_up_expiry(remaining_ms > 0 && remaining_ms < UINT32_MAX
+                                                   ? (uint32_t)remaining_ms
+                                                   : 0);
+        }
     } else {
         assistant_state = SATELLITE_ASSISTANT_ERROR;
     }
@@ -653,6 +669,7 @@ void satellite_protocol_reset(void)
     idle_pending = false;
     barge_in_turn_pending = false;
     assistant_state = SATELLITE_ASSISTANT_IDLE;
+    satellite_ui_post_assistant_state(assistant_state);
     if (heartbeat_timer != NULL && esp_timer_is_active(heartbeat_timer)) {
         esp_timer_stop(heartbeat_timer);
     }
