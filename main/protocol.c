@@ -21,9 +21,7 @@
 #define CONTROL_MESSAGE_MAX_BYTES 2048
 #define DOWNLINK_MAX_BYTES 4096
 #define TURN_ID_MAX_BYTES 64
-#define HEARTBEAT_MIN_MS 1000
-#define HEARTBEAT_MAX_MS 60000
-#define HEARTBEAT_MAX_UNACKNOWLEDGED_REPORTS 3
+#define HEALTH_REQUEST_ID_MAX_BYTES 64
 #define IDLE_DRAIN_MS 250
 #define IDLE_RESPONSE_START_MS 5000
 #define WEBSOCKET_SEND_TIMEOUT_MS 1000
@@ -43,7 +41,6 @@ static char device_token[257];
 static char active_turn_id[TURN_ID_MAX_BYTES + 1];
 static char session_id[TURN_ID_MAX_BYTES + 1];
 static esp_websocket_client_handle_t protocol_websocket;
-static esp_timer_handle_t heartbeat_timer;
 static esp_timer_handle_t idle_drain_timer;
 static esp_timer_handle_t recovery_timer;
 static SemaphoreHandle_t websocket_send_lock;
@@ -54,9 +51,6 @@ static bool barge_in_turn_pending;
 static satellite_assistant_state_t assistant_state = SATELLITE_ASSISTANT_IDLE;
 static uint32_t uplink_frames_sent;
 static int64_t last_uplink_send_us;
-static volatile uint32_t heartbeat_acknowledgements;
-static uint32_t observed_heartbeat_acknowledgements;
-static uint8_t unacknowledged_health_reports;
 static int16_t *downlink_payload_samples;
 static size_t downlink_payload_bytes;
 static size_t downlink_payload_length;
@@ -67,7 +61,6 @@ static uint32_t expected_downlink_sequence;
 static uint32_t last_played_sequence;
 static bool last_played_sequence_valid;
 static bool recovery_pending;
-static int protocol_minor;
 
 static void clear_tts_audio_pending(void)
 {
@@ -91,7 +84,6 @@ static void clear_recovery_state(void)
     expected_downlink_sequence = 0;
     last_played_sequence = 0;
     last_played_sequence_valid = false;
-    protocol_minor = 0;
     clear_tts_audio_pending();
     if (recovery_timer != NULL && esp_timer_is_active(recovery_timer)) {
         esp_timer_stop(recovery_timer);
@@ -163,54 +155,31 @@ static void reconnect_after_send_failure(void)
     satellite_connectivity_reconnect();
 }
 
-static void heartbeat_timer_callback(void *argument)
+static bool respond_to_health_request(const char *request_id)
 {
-    (void)argument;
-    char health[192];
+    char health[320];
 
-    if (!protocol_ready || protocol_websocket == NULL) {
-        return;
-    }
-    if (heartbeat_acknowledgements != observed_heartbeat_acknowledgements) {
-        observed_heartbeat_acknowledgements = heartbeat_acknowledgements;
-        unacknowledged_health_reports = 0;
+    if (strnlen(request_id, HEALTH_REQUEST_ID_MAX_BYTES + 1) > HEALTH_REQUEST_ID_MAX_BYTES) {
+        return false;
     }
     const satellite_audio_metrics_t metrics = satellite_audio_metrics();
     const int health_length = snprintf(
         health, sizeof(health),
-        "{\"type\":\"satellite.health\",\"dropped_uplink_frames\":%lu,"
+        "{\"type\":\"satellite.health_response\",\"id\":\"%s\",\"dropped_uplink_frames\":%lu,"
         "\"dropped_downlink_frames\":%lu,\"capture_overruns\":%lu,\"playback_underruns\":%lu}",
-        (unsigned long)metrics.dropped_uplink_frames, (unsigned long)metrics.dropped_downlink_frames,
+        request_id, (unsigned long)metrics.dropped_uplink_frames, (unsigned long)metrics.dropped_downlink_frames,
         (unsigned long)metrics.capture_overruns, (unsigned long)metrics.playback_underruns);
     if (health_length < 0 || health_length >= (int)sizeof(health)) {
-        ESP_LOGW(TAG, "Unable to format health report");
-        return;
+        return false;
     } else if (xSemaphoreTake(websocket_send_lock, pdMS_TO_TICKS(1000)) != pdPASS) {
-        ESP_LOGW(TAG, "Unable to acquire WebSocket send lock for health report");
-        reconnect_after_send_failure();
-        return;
+        return false;
     } else {
-        bool send_failed = false;
-        if (!protocol_ready || protocol_websocket == NULL ||
-            esp_websocket_client_send_text(protocol_websocket, health, health_length,
-                                            pdMS_TO_TICKS(WEBSOCKET_SEND_TIMEOUT_MS)) < 0) {
-            ESP_LOGW(TAG, "Unable to send health report");
-            send_failed = true;
-        }
+        const bool sent = protocol_ready && protocol_websocket != NULL &&
+                          esp_websocket_client_send_text(protocol_websocket, health, health_length,
+                                                         pdMS_TO_TICKS(WEBSOCKET_SEND_TIMEOUT_MS)) >= 0;
         xSemaphoreGive(websocket_send_lock);
-        if (send_failed) {
-            reconnect_after_send_failure();
-            return;
-        }
+        return sent;
     }
-    unacknowledged_health_reports++;
-    if (unacknowledged_health_reports >= HEARTBEAT_MAX_UNACKNOWLEDGED_REPORTS) {
-        ESP_LOGW(TAG, "Server did not acknowledge %u health reports; reconnecting",
-                 HEARTBEAT_MAX_UNACKNOWLEDGED_REPORTS);
-        reconnect_after_send_failure();
-        return;
-    }
-    ESP_LOGI(TAG, "Protocol ready; sent %lu uplink audio frames", (unsigned long)uplink_frames_sent);
 }
 
 static void complete_idle_state(void)
@@ -277,30 +246,16 @@ static bool validate_welcome(const cJSON *welcome)
     const char *session;
     int major;
     int minor;
-    int heartbeat_interval;
 
     if (!json_string(welcome, "session_id", &session) || session[0] == '\0' ||
         strnlen(session, TURN_ID_MAX_BYTES + 1) > TURN_ID_MAX_BYTES || !cJSON_IsObject(version) ||
          !json_integer(version, "major", &major) || major != 2 ||
-         !json_integer(version, "minor", &minor) || (minor != 1 && minor != 2) ||
-        !json_integer(welcome, "heartbeat_interval_ms", &heartbeat_interval) ||
-        heartbeat_interval < HEARTBEAT_MIN_MS || heartbeat_interval > HEARTBEAT_MAX_MS ||
+         !json_integer(version, "minor", &minor) || minor != 3 ||
         !validate_audio_contract(welcome)) {
         return false;
     }
 
-    if (esp_timer_start_periodic(heartbeat_timer, (uint64_t)heartbeat_interval * 1000ULL) != ESP_OK) {
-        return false;
-    }
-    if (recovery_pending && minor != 2) {
-        // A v1 server cannot honour a resume request; never replay stale PCM.
-        clear_recovery_state();
-        assistant_state = SATELLITE_ASSISTANT_IDLE;
-        satellite_audio_reset();
-        satellite_ui_post_assistant_state(assistant_state);
-    }
     strlcpy(session_id, session, sizeof(session_id));
-    protocol_minor = minor;
     protocol_ready = true;
     if (recovery_pending) {
         expected_downlink_sequence = last_played_sequence_valid ? last_played_sequence + 1 : 0;
@@ -358,7 +313,7 @@ static void handle_binary_message(esp_websocket_client_handle_t websocket,
         reset_downlink_payload();
         return;
     }
-    if (protocol_minor == 2 && !tts_audio_pending) {
+    if (!tts_audio_pending) {
         protocol_violation(websocket);
         reset_downlink_payload();
         return;
@@ -589,9 +544,10 @@ static bool handle_control_message(esp_websocket_client_handle_t websocket, cons
                 idle_pending = true;
                 schedule_idle_completion(IDLE_DRAIN_MS);
             }
-        } else if (strcmp(type, "satellite.heartbeat") == 0) {
-            heartbeat_acknowledgements++;
-            valid = true;
+        } else if (strcmp(type, "satellite.health_request") == 0) {
+            const char *request_id;
+            valid = json_string(message, "id", &request_id) && request_id[0] != '\0' &&
+                    respond_to_health_request(request_id);
         } else if (strcmp(type, "conversation_mode.changed") == 0 ||
                    strcmp(type, "conversation.transcript") == 0 ||
                    strcmp(type, "conversation.response") == 0) {
@@ -628,11 +584,6 @@ esp_err_t satellite_protocol_init(void)
     if (websocket_send_lock == NULL) {
         return ESP_ERR_NO_MEM;
     }
-    const esp_timer_create_args_t timer_config = {
-        .callback = heartbeat_timer_callback,
-        .name = "health",
-    };
-    ESP_RETURN_ON_ERROR(esp_timer_create(&timer_config, &heartbeat_timer), TAG, "Health timer creation failed");
     const esp_timer_create_args_t idle_timer_config = {
         .callback = idle_drain_timer_callback,
         .name = "idle_drain",
@@ -659,9 +610,6 @@ void satellite_protocol_reset(void)
     protocol_ready = false;
     uplink_frames_sent = 0;
     last_uplink_send_us = 0;
-    heartbeat_acknowledgements = 0;
-    observed_heartbeat_acknowledgements = 0;
-    unacknowledged_health_reports = 0;
     reset_downlink_payload();
     protocol_websocket = NULL;
     clear_recovery_state();
@@ -670,9 +618,6 @@ void satellite_protocol_reset(void)
     barge_in_turn_pending = false;
     assistant_state = SATELLITE_ASSISTANT_IDLE;
     satellite_ui_post_assistant_state(assistant_state);
-    if (heartbeat_timer != NULL && esp_timer_is_active(heartbeat_timer)) {
-        esp_timer_stop(heartbeat_timer);
-    }
     if (idle_drain_timer != NULL && esp_timer_is_active(idle_drain_timer)) {
         esp_timer_stop(idle_drain_timer);
     }
@@ -686,11 +631,6 @@ void satellite_protocol_disconnected(void)
     protocol_websocket = NULL;
     reset_downlink_payload();
     clear_tts_audio_pending();
-    observed_heartbeat_acknowledgements = heartbeat_acknowledgements;
-    unacknowledged_health_reports = 0;
-    if (heartbeat_timer != NULL && esp_timer_is_active(heartbeat_timer)) {
-        esp_timer_stop(heartbeat_timer);
-    }
     if (!can_recover) {
         satellite_protocol_reset();
         satellite_audio_reset();
@@ -731,7 +671,7 @@ bool satellite_protocol_connected(esp_websocket_client_handle_t websocket)
     cJSON_AddStringToObject(hello, "token", device_token);
     cJSON_AddStringToObject(version, "name", "satellite-v2");
     cJSON_AddNumberToObject(version, "major", 2);
-    cJSON_AddNumberToObject(version, "minor", 2);
+    cJSON_AddNumberToObject(version, "minor", 3);
     cJSON_AddStringToObject(device, "id", device_id);
     cJSON_AddStringToObject(device, "name", device_name);
     cJSON_AddStringToObject(device, "firmware", "0.1.0");

@@ -108,18 +108,21 @@ class ProtocolFixtureTests(unittest.TestCase):
         hello = {
             "type": "satellite.hello",
             "token": "fixture-token",
-            "protocol": {"name": "satellite-v2", "major": 2, "minor": 2},
+            "protocol": {"name": "satellite-v2", "major": 2, "minor": 3},
             "device": {"id": "fixture-01", "name": "Fixture", "firmware": "0.1.0", "build": "test", "board": "rev2"},
             "capabilities": {"audio_input": True, "audio_output": True, "display": True, "touch": True},
         }
         self.assertTrue(fixture.validate_hello(hello))
         self.assertEqual(fixture.scenario_messages("normal")[0]["type"], "satellite.welcome")
+        self.assertEqual(fixture.scenario_messages("normal")[1], {
+            "type": "satellite.health_request", "id": "fixture-health-1",
+        })
 
     def test_resume_hello_uses_last_fully_played_sequence(self):
         hello = {
             "type": "satellite.hello",
             "token": "fixture-token",
-            "protocol": {"name": "satellite-v2", "major": 2, "minor": 2},
+            "protocol": {"name": "satellite-v2", "major": 2, "minor": 3},
             "device": {"id": "fixture-01", "name": "Fixture", "firmware": "0.1.0", "build": "test", "board": "rev2"},
             "capabilities": {"audio_input": True, "audio_output": True, "display": True, "touch": True},
             "resume": {"session_id": "prior-session", "turn_id": "turn-1", "next_seq": 7},

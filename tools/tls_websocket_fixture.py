@@ -13,7 +13,7 @@ from typing import Any
 WELCOME = {
     "type": "satellite.welcome",
     "session_id": "fixture-session",
-    "protocol": {"major": 2, "minor": 2},
+    "protocol": {"major": 2, "minor": 3},
     "audio": {
         "uplink": {"encoding": "pcm_s16le", "sample_rate_hz": 16000, "channels": 1, "frame_duration_ms": 20},
         "downlink": {"encoding": "pcm_s16le", "sample_rate_hz": 16000, "channels": 1},
@@ -37,7 +37,7 @@ def validate_hello(message: dict[str, Any]) -> bool:
         message.get("type") == "satellite.hello"
         and isinstance(message.get("token"), str)
         and bool(message["token"])
-        and protocol == {"name": "satellite-v2", "major": 2, "minor": 2}
+        and protocol == {"name": "satellite-v2", "major": 2, "minor": 3}
         and isinstance(device, dict)
         and all(isinstance(device.get(field), str) and device[field] for field in ("id", "name", "firmware", "build", "board"))
         and isinstance(capabilities, dict)
@@ -50,6 +50,7 @@ def scenario_messages(name: str) -> list[dict[str, Any]]:
     if name == "normal":
         return [
             WELCOME,
+            {"type": "satellite.health_request", "id": "fixture-health-1"},
             {"type": "assistant.state", "state": "wake_detected", "turn_id": "fixture-turn"},
             {"type": "assistant.state", "state": "listening", "turn_id": "fixture-turn"},
             {"type": "assistant.state", "state": "thinking", "turn_id": "fixture-turn"},
