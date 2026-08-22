@@ -430,6 +430,8 @@ esp_err_t satellite_connectivity_start(void)
         .network_timeout_ms = WEBSOCKET_NETWORK_TIMEOUT_MS,
         .ping_interval_sec = 10,
         .pingpong_timeout_sec = 15,
+        // Server health challenges provide the authoritative liveness check.
+        .disable_pingpong_discon = true,
     };
     websocket = esp_websocket_client_init(&websocket_config);
     if (websocket == NULL) {

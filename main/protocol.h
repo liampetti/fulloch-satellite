@@ -28,4 +28,5 @@ esp_err_t satellite_protocol_send_uplink(const int16_t *samples, size_t sample_c
 satellite_assistant_state_t satellite_protocol_assistant_state(void);
 bool satellite_protocol_ready(void);
 esp_err_t satellite_protocol_send_stop(void);
+esp_err_t satellite_protocol_set_conversation_mode(bool enabled);
 void satellite_protocol_playback_frame_completed(uint32_t sequence);

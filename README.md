@@ -46,6 +46,11 @@ Replace every example value before flashing. In particular:
 - Set `audio.speaker_volume_percent` from 0 to 100. This controls the ES8311
   codec output level.
 - Leave `audio.aec_enabled` enabled to reduce speaker feedback.
+- Leave `audio.uplink_channels` at `1` for the established mono AEC uplink.
+  Set it to `2` only after the server supports negotiated dual-channel AEC
+  processing; this requires `audio.aec_enabled`.
+- Set `display.rotation_degrees` to `0` for the normal orientation or `180` to
+  restore the previous upside-down display and touch orientation.
 - Select the music source with `music.player`. Options are `spotify` or `sonos` currently. If using Spotify controls, set `music.player` to `spotify` and add the Spotify client credentials to the json. Requires Spotify Premium. If you are using a Sonos speaker, set it to `sonos` and set `sonos.host` to the IP address of the Sonos speaker to control.
 
 The example json is a valid Spotify configuration. To use Sonos, replace
@@ -91,4 +96,13 @@ The display progresses through audio and network status messages while the
 board initializes. Tap the screen while idle to see date and time and a small led icon indicating connection state. Swipe either direction to change screen to music controls for the selected player.
 
 During a server-driven voice turn, the display shows layered pulsing circles
-from wake detection through follow-up listening. A tap on the pulsing rings during an active voice turn sends a stop message, clears queued audio, and returns the device to idle.
+from wake detection through follow-up listening. A short tap on the pulsing
+rings during an active voice turn sends a stop message, clears queued audio,
+and returns the device to idle.
+
+Hold the display for 1.5 seconds to toggle Conversation mode. The server
+confirms the change before the display updates: Conversation mode uses a
+continuous blue-green ring pulse to show that wakeword-free listening is active;
+normal mode returns to the usual green turn-only pulse. A long press also stops
+any in-flight turn before changing modes. Swipes and music controls retain their
+existing behavior.

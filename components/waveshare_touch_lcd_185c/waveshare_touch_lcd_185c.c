@@ -18,6 +18,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "nvs.h"
 
 static const char *TAG = "waveshare_rev2";
 
@@ -62,6 +63,7 @@ static i2c_master_dev_handle_t touch;
 static uint8_t expander_output;
 static esp_lcd_panel_io_handle_t lcd_io;
 static bool board_io_initialized;
+static bool display_rotated;
 static i2s_chan_handle_t i2s_tx;
 static i2s_chan_handle_t i2s_rx;
 static esp_codec_dev_handle_t playback;
@@ -258,7 +260,7 @@ static esp_err_t st77916_write_registers(const st77916_register_t *registers, si
 
 static esp_err_t st77916_initialize(void)
 {
-    const uint8_t madctl = 0xc0;
+    const uint8_t madctl = display_rotated ? 0xc0 : 0x00;
     const uint8_t color_mode = 0x55;
     ESP_RETURN_ON_ERROR(lcd_command(0x01, NULL, 0), TAG, "LCD software reset failed");
     vTaskDelay(pdMS_TO_TICKS(120));
@@ -273,11 +275,31 @@ static esp_err_t st77916_initialize(void)
     return lcd_command(0x29, NULL, 0);
 }
 
+static esp_err_t load_display_rotation(void)
+{
+    char rotation[4];
+    size_t rotation_size = sizeof(rotation);
+    nvs_handle_t handle;
+    ESP_RETURN_ON_ERROR(nvs_open("display", NVS_READONLY, &handle), TAG, "display config unavailable");
+    const esp_err_t error = nvs_get_str(handle, "rotation", rotation, &rotation_size);
+    nvs_close(handle);
+    ESP_RETURN_ON_ERROR(error, TAG, "display rotation unavailable");
+    if (strcmp(rotation, "0") == 0) {
+        display_rotated = false;
+    } else if (strcmp(rotation, "180") == 0) {
+        display_rotated = true;
+    } else {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return ESP_OK;
+}
+
 esp_err_t waveshare_touch_lcd_185c_init_display(void)
 {
     if (lcd_io != NULL) {
         return ESP_ERR_INVALID_STATE;
     }
+    ESP_RETURN_ON_ERROR(load_display_rotation(), TAG, "display rotation setup failed");
     ESP_RETURN_ON_ERROR(init_board_io(), TAG, "board I/O initialization failed");
 
     const spi_bus_config_t bus_config = {
@@ -368,8 +390,8 @@ bool waveshare_touch_lcd_185c_read_touch(uint16_t *x, uint16_t *y)
     if (raw_x >= LCD_WIDTH || raw_y >= LCD_HEIGHT) {
         return false;
     }
-    *x = LCD_WIDTH - 1 - raw_x;
-    *y = LCD_HEIGHT - 1 - raw_y;
+    *x = display_rotated ? LCD_WIDTH - 1 - raw_x : raw_x;
+    *y = display_rotated ? LCD_HEIGHT - 1 - raw_y : raw_y;
     return true;
 }
 
@@ -498,6 +520,9 @@ esp_err_t waveshare_touch_lcd_185c_play_mono_s16le(const int16_t *samples, size_
 {
     ESP_RETURN_ON_FALSE(playback != NULL && samples != NULL && sample_count > 0,
                         ESP_ERR_INVALID_ARG, TAG, "invalid playback samples");
+    // Keep the NS4150B enabled at the hardware write boundary. Assistant-state
+    // transitions can race or be delayed independently of queued PCM.
+    ESP_RETURN_ON_ERROR(gpio_set_level(PA_ENABLE, 1), TAG, "amplifier enable failed");
     for (size_t offset = 0; offset < sample_count; offset += PLAYBACK_BLOCK_SAMPLES) {
         const size_t block_samples = sample_count - offset < PLAYBACK_BLOCK_SAMPLES
                                          ? sample_count - offset

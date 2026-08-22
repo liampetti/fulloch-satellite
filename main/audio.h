@@ -14,7 +14,9 @@ typedef struct {
 } satellite_audio_metrics_t;
 
 esp_err_t satellite_audio_start(void);
-esp_err_t satellite_audio_enable_aec(void);
+uint8_t satellite_audio_supported_uplink_channels(void);
+uint8_t satellite_audio_active_uplink_channels(void);
+esp_err_t satellite_audio_enable_aec(uint8_t uplink_channels);
 bool satellite_audio_aec_active(void);
 void satellite_audio_reset(void);
 void satellite_audio_discard_uplink(void);

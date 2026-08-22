@@ -13,7 +13,7 @@ from typing import Any
 WELCOME = {
     "type": "satellite.welcome",
     "session_id": "fixture-session",
-    "protocol": {"major": 2, "minor": 3},
+    "protocol": {"major": 2, "minor": 5},
     "audio": {
         "uplink": {"encoding": "pcm_s16le", "sample_rate_hz": 16000, "channels": 1, "frame_duration_ms": 20},
         "downlink": {"encoding": "pcm_s16le", "sample_rate_hz": 16000, "channels": 1},
@@ -37,12 +37,38 @@ def validate_hello(message: dict[str, Any]) -> bool:
         message.get("type") == "satellite.hello"
         and isinstance(message.get("token"), str)
         and bool(message["token"])
-        and protocol == {"name": "satellite-v2", "major": 2, "minor": 3}
+        and isinstance(protocol, dict)
+        and protocol.get("name") == "satellite-v2"
+        and protocol.get("major") == 2
+        and protocol.get("minor") in (4, 5)
         and isinstance(device, dict)
         and all(isinstance(device.get(field), str) and device[field] for field in ("id", "name", "firmware", "build", "board"))
         and isinstance(capabilities, dict)
         and all(capabilities.get(field) is True for field in ("audio_input", "audio_output", "display", "touch"))
+        and (protocol["minor"] == 4 or capabilities.get("aec_uplink_channels") in ([1], [1, 2]))
         and resume_valid
+    )
+
+
+def validate_welcome(message: dict[str, Any], hello: dict[str, Any]) -> bool:
+    protocol = message.get("protocol")
+    audio = message.get("audio")
+    uplink = audio.get("uplink") if isinstance(audio, dict) else None
+    downlink = audio.get("downlink") if isinstance(audio, dict) else None
+    supported_channels = hello.get("capabilities", {}).get("aec_uplink_channels", [1])
+    return (
+        message.get("type") == "satellite.welcome"
+        and isinstance(protocol, dict)
+        and protocol.get("major") == 2
+        and protocol.get("minor") in (4, 5)
+        and isinstance(uplink, dict)
+        and uplink.get("encoding") == "pcm_s16le"
+        and uplink.get("sample_rate_hz") == 16000
+        and uplink.get("frame_duration_ms") == 20
+        and uplink.get("channels") in (1, 2)
+        and (protocol["minor"] == 5 or uplink["channels"] == 1)
+        and uplink["channels"] in supported_channels
+        and downlink == {"encoding": "pcm_s16le", "sample_rate_hz": 16000, "channels": 1}
     )
 
 

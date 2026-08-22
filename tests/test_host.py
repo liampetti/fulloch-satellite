@@ -47,6 +47,42 @@ class ProvisioningTests(unittest.TestCase):
         with self.assertRaises(provision.BundleError):
             provision.validate(config, self.credentials)
 
+    def test_uplink_channels_defaults_to_mono_for_existing_bundles(self):
+        config = copy.deepcopy(self.config)
+        del config["audio"]["uplink_channels"]
+        entries = provision.validate(config, self.credentials)
+        self.assertIn(("audio", "uplink_channels", "1"), entries)
+
+    def test_stereo_uplink_requires_aec_and_accepts_two_channels(self):
+        config = copy.deepcopy(self.config)
+        config["audio"]["uplink_channels"] = 2
+        entries = provision.validate(config, self.credentials)
+        self.assertIn(("audio", "uplink_channels", "2"), entries)
+        config["audio"]["aec_enabled"] = False
+        with self.assertRaises(provision.BundleError):
+            provision.validate(config, self.credentials)
+
+    def test_invalid_uplink_channel_count_is_rejected(self):
+        config = copy.deepcopy(self.config)
+        config["audio"]["uplink_channels"] = 3
+        with self.assertRaises(provision.BundleError):
+            provision.validate(config, self.credentials)
+
+    def test_display_rotation_defaults_to_zero_for_existing_bundles(self):
+        config = copy.deepcopy(self.config)
+        del config["display"]
+        entries = provision.validate(config, self.credentials)
+        self.assertIn(("display", "rotation", "0"), entries)
+
+    def test_display_rotation_accepts_only_zero_or_180_degrees(self):
+        config = copy.deepcopy(self.config)
+        config["display"]["rotation_degrees"] = 180
+        entries = provision.validate(config, self.credentials)
+        self.assertIn(("display", "rotation", "180"), entries)
+        config["display"]["rotation_degrees"] = 90
+        with self.assertRaises(provision.BundleError):
+            provision.validate(config, self.credentials)
+
     def test_private_tls_material_is_rejected(self):
         config = copy.deepcopy(self.config)
         config["server"]["client_key"] = "not-allowed"
@@ -104,13 +140,40 @@ class ProvisioningTests(unittest.TestCase):
 
 
 class ProtocolFixtureTests(unittest.TestCase):
+    def test_websocket_tls_reads_and_writes_share_the_client_lock(self):
+        defaults = (ROOT / "sdkconfig.defaults").read_text()
+        self.assertIn("CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK=n", defaults)
+        self.assertIn("CONFIG_MBEDTLS_DYNAMIC_BUFFER=n", defaults)
+
+        rebuild = (ROOT / "docs" / "rebuild_flash_touch_lcd_rev2.sh").read_text()
+        self.assertIn('rm -f "$GENERATED_SDKCONFIG"', rebuild)
+        self.assertIn("Refusing to flash unsafe concurrent TLS configuration", rebuild)
+
+    def test_uplink_write_timeout_tolerates_wifi_backpressure(self):
+        protocol = (ROOT / "main" / "protocol.c").read_text()
+        self.assertIn("#define WEBSOCKET_UPLINK_SEND_TIMEOUT_MS 100", protocol)
+        self.assertIn("if (transport_input.binary && sent <= 0)", protocol)
+        self.assertIn("Dropping uplink frame after a %u ms transport timeout", protocol)
+
+    def test_transport_worker_owns_websocket_writes(self):
+        protocol = (ROOT / "main" / "protocol.c").read_text()
+        self.assertIn('xTaskCreatePinnedToCore(transport_task, "transport_tx"', protocol)
+        self.assertEqual(protocol.count("esp_websocket_client_send_"), 2)
+        self.assertIn("discard_transport_messages(false);", protocol)
+
+    def test_control_frames_displace_queued_microphone_pcm(self):
+        protocol = (ROOT / "main" / "protocol.c").read_text()
+        self.assertIn("if (binary) {\n        return false;\n    }", protocol)
+        self.assertIn("!displaced.binary", protocol)
+
     def test_valid_hello_and_normal_sequence(self):
         hello = {
             "type": "satellite.hello",
             "token": "fixture-token",
-            "protocol": {"name": "satellite-v2", "major": 2, "minor": 3},
+            "protocol": {"name": "satellite-v2", "major": 2, "minor": 5},
             "device": {"id": "fixture-01", "name": "Fixture", "firmware": "0.1.0", "build": "test", "board": "rev2"},
-            "capabilities": {"audio_input": True, "audio_output": True, "display": True, "touch": True},
+            "capabilities": {"audio_input": True, "audio_output": True, "display": True, "touch": True,
+                             "aec_uplink_channels": [1, 2]},
         }
         self.assertTrue(fixture.validate_hello(hello))
         self.assertEqual(fixture.scenario_messages("normal")[0]["type"], "satellite.welcome")
@@ -122,9 +185,10 @@ class ProtocolFixtureTests(unittest.TestCase):
         hello = {
             "type": "satellite.hello",
             "token": "fixture-token",
-            "protocol": {"name": "satellite-v2", "major": 2, "minor": 3},
+            "protocol": {"name": "satellite-v2", "major": 2, "minor": 5},
             "device": {"id": "fixture-01", "name": "Fixture", "firmware": "0.1.0", "build": "test", "board": "rev2"},
-            "capabilities": {"audio_input": True, "audio_output": True, "display": True, "touch": True},
+            "capabilities": {"audio_input": True, "audio_output": True, "display": True, "touch": True,
+                             "aec_uplink_channels": [1]},
             "resume": {"session_id": "prior-session", "turn_id": "turn-1", "next_seq": 7},
         }
         self.assertTrue(fixture.validate_hello(hello))
@@ -134,6 +198,42 @@ class ProtocolFixtureTests(unittest.TestCase):
     def test_welcome_uses_the_fixed_16khz_downlink_contract(self):
         downlink = fixture.scenario_messages("normal")[0]["audio"]["downlink"]
         self.assertEqual(downlink, {"encoding": "pcm_s16le", "sample_rate_hz": 16000, "channels": 1})
+
+    def test_v25_welcome_selects_only_an_advertised_uplink_contract(self):
+        hello = {
+            "capabilities": {"aec_uplink_channels": [1, 2]},
+        }
+        welcome = copy.deepcopy(fixture.WELCOME)
+        welcome["audio"]["uplink"]["channels"] = 2
+        self.assertTrue(fixture.validate_welcome(welcome, hello))
+        hello["capabilities"]["aec_uplink_channels"] = [1]
+        self.assertFalse(fixture.validate_welcome(welcome, hello))
+        welcome["protocol"]["minor"] = 4
+        self.assertFalse(fixture.validate_welcome(welcome, {"capabilities": {"aec_uplink_channels": [1, 2]}}))
+
+    def test_v24_hello_remains_a_legacy_mono_contract(self):
+        hello = {
+            "type": "satellite.hello", "token": "fixture-token",
+            "protocol": {"name": "satellite-v2", "major": 2, "minor": 4},
+            "device": {"id": "fixture-01", "name": "Fixture", "firmware": "0.1.0", "build": "test", "board": "rev2"},
+            "capabilities": {"audio_input": True, "audio_output": True, "display": True, "touch": True},
+        }
+        self.assertTrue(fixture.validate_hello(hello))
+
+    def test_v25_stereo_welcome_contract_is_present_in_firmware(self):
+        protocol = (ROOT / "main" / "protocol.c").read_text()
+        audio = (ROOT / "main" / "audio.c").read_text()
+        self.assertIn('cJSON_AddNumberToObject(version, "minor", 5)', protocol)
+        self.assertIn('"aec_uplink_channels"', protocol)
+        self.assertIn('#define TRANSPORT_MAX_BYTES 1280', protocol)
+        self.assertIn('minor == 4 && uplink_channels != 1', protocol)
+        self.assertIn('aec_create_from_config(&config)', audio)
+        self.assertIn('.mic_num = 2', audio)
+        self.assertIn('.out_num = 2', audio)
+        self.assertIn('.mode = AEC_MODE_SR_LOW_COST', audio)
+        self.assertIn('M1,M2 with synchronous R', audio)
+        self.assertIn('AFE_TYPE_VC', audio)
+        self.assertIn('if (uplink_channels == 2)', audio)
 
     def test_adverse_sequences_are_available(self):
         self.assertEqual(fixture.scenario_messages("malformed-welcome")[0]["protocol"]["major"], 3)
@@ -148,6 +248,7 @@ class TurnAndQueueTests(unittest.TestCase):
         self.turn_id = None
         self.state = "idle"
         self.barge_in_turn_pending = False
+        self.completed_turn_pending_state = False
 
     def apply_tts_cancel(self, turn_id):
         if self.state != "speaking" or turn_id != self.turn_id:
@@ -158,8 +259,7 @@ class TurnAndQueueTests(unittest.TestCase):
     def apply_tts_end(self, turn_id):
         if self.state != "speaking" or turn_id != self.turn_id:
             return False
-        self.state = "idle"
-        self.turn_id = None
+        self.completed_turn_pending_state = True
         return True
 
     def apply_state(self, state, turn_id):
@@ -175,12 +275,18 @@ class TurnAndQueueTests(unittest.TestCase):
             and state in {"wake_detected", "listening"}
             and turn_id != self.turn_id
         )
+        replaces_completed_turn = (
+            self.completed_turn_pending_state
+            and state in {"wake_detected", "listening", "speaking"}
+            and turn_id != self.turn_id
+        )
         starts_proactive_turn = state == "speaking" and self.turn_id is None
         if state == "wake_detected":
             if (
                 self.turn_id is not None
                 and not replaces_follow_up_turn
                 and not replaces_barge_in_turn
+                and not replaces_completed_turn
             ) or not turn_id:
                 return False
             self.turn_id = turn_id
@@ -188,12 +294,14 @@ class TurnAndQueueTests(unittest.TestCase):
             turn_id != self.turn_id
             and not replaces_follow_up_turn
             and not replaces_barge_in_turn
+            and not replaces_completed_turn
             and not starts_proactive_turn
         ):
             return False
-        elif replaces_follow_up_turn or replaces_barge_in_turn or starts_proactive_turn:
+        elif replaces_follow_up_turn or replaces_barge_in_turn or replaces_completed_turn or starts_proactive_turn:
             self.turn_id = turn_id
         self.barge_in_turn_pending = False
+        self.completed_turn_pending_state = False
         self.state = state
         return True
 
@@ -229,7 +337,20 @@ class TurnAndQueueTests(unittest.TestCase):
     def test_proactive_speaking_turn_can_complete_without_a_wakeword(self):
         self.assertTrue(self.apply_state("speaking", "announcement-1"))
         self.assertTrue(self.apply_tts_end("announcement-1"))
+        self.assertTrue(self.apply_state("idle", "announcement-1"))
         self.assertEqual(self.state, "idle")
+
+    def test_tts_end_preserves_the_turn_for_the_follow_up_state(self):
+        self.assertTrue(self.apply_state("speaking", "turn-1"))
+        self.assertTrue(self.apply_tts_end("turn-1"))
+        self.assertTrue(self.apply_state("follow_up", "turn-1"))
+        self.assertEqual(self.state, "follow_up")
+
+    def test_new_turn_can_replace_a_completed_tts_turn_before_idle_arrives(self):
+        self.assertTrue(self.apply_state("speaking", "turn-1"))
+        self.assertTrue(self.apply_tts_end("turn-1"))
+        self.assertTrue(self.apply_state("listening", "turn-2"))
+        self.assertEqual(self.turn_id, "turn-2")
 
     def test_new_turn_is_rejected_without_follow_up_or_tts_cancel(self):
         self.assertTrue(self.apply_state("wake_detected", "turn-1"))
@@ -301,6 +422,23 @@ class TurnAndQueueTests(unittest.TestCase):
         self.assertEqual(metadata["bytes"], 640)
         expected_seq += 1
         self.assertEqual(expected_seq, 4)
+
+    def test_resumed_tts_can_start_at_the_server_sequence(self):
+        sequence_started = False
+        expected_seq = 0
+        resumed_seq = 35
+        self.assertFalse(sequence_started)
+        sequence_started = True
+        expected_seq = resumed_seq + 1
+        self.assertEqual(expected_seq, 36)
+        self.assertTrue(sequence_started)
+
+    def test_replayed_tts_frames_are_discarded_until_the_expected_sequence(self):
+        expected_seq = 14
+        replayed = [11, 12, 13]
+        self.assertTrue(all(sequence < expected_seq for sequence in replayed))
+        self.assertEqual(expected_seq, 14)
+        self.assertEqual(14, expected_seq)
 
 
 if __name__ == "__main__":

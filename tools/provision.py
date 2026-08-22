@@ -52,7 +52,7 @@ def require_integer(value: object, name: str, minimum: int, maximum: int) -> int
 def validate(config: dict, credentials: dict) -> list[tuple[str, str, str]]:
     config_keys = {"schema_version", "device", "server", "audio", "music"}
     credential_keys = {"schema_version", "wifi", "fulloch"}
-    optional_config_keys = {"sonos"} if "sonos" in config else set()
+    optional_config_keys = {key for key in ("display", "sonos") if key in config}
     require_keys(config, config_keys | optional_config_keys, "config")
     require_keys(credentials, credential_keys | ({"spotify"} if "spotify" in credentials else set()), "credentials")
     if config["schema_version"] != 1 or credentials["schema_version"] != 1:
@@ -61,18 +61,26 @@ def validate(config: dict, credentials: dict) -> list[tuple[str, str, str]]:
     device = config["device"]
     server = config["server"]
     audio = config["audio"]
+    display = config.get("display")
     wifi = credentials["wifi"]
     fulloch = credentials["fulloch"]
     for value, keys, name in (
         (device, {"id", "name", "timezone"}, "device"),
         (server, {"url"}, "server"),
-        (audio, {"speaker_volume_percent", "aec_enabled"}, "audio"),
         (wifi, {"ssid", "password"}, "wifi"),
         (fulloch, {"device_token"}, "fulloch"),
     ):
         if not isinstance(value, dict):
             raise BundleError(f"{name} must be an object")
         require_keys(value, keys, name)
+    if not isinstance(audio, dict):
+        raise BundleError("audio must be an object")
+    require_keys(audio, {"speaker_volume_percent", "aec_enabled"} |
+                 ({"uplink_channels"} if "uplink_channels" in audio else set()), "audio")
+    if display is not None:
+        if not isinstance(display, dict):
+            raise BundleError("display must be an object")
+        require_keys(display, {"rotation_degrees"}, "display")
 
     if "spotify" in credentials:
         spotify_credentials = credentials["spotify"]
@@ -105,6 +113,13 @@ def validate(config: dict, credentials: dict) -> list[tuple[str, str, str]]:
         raise BundleError("server.url must be a wss:// URL without user credentials")
     if not isinstance(audio["aec_enabled"], bool):
         raise BundleError("audio.aec_enabled must be a boolean")
+    uplink_channels = require_integer(audio.get("uplink_channels", 1), "audio.uplink_channels", 1, 2)
+    if uplink_channels == 2 and not audio["aec_enabled"]:
+        raise BundleError("audio.uplink_channels requires audio.aec_enabled")
+    rotation_degrees = require_integer(display.get("rotation_degrees", 0) if display else 0,
+                                       "display.rotation_degrees", 0, 180)
+    if rotation_degrees not in (0, 180):
+        raise BundleError("display.rotation_degrees must be 0 or 180")
 
     values = [
         ("device", "id", require_string(device["id"], "device.id", 64)),
@@ -113,6 +128,8 @@ def validate(config: dict, credentials: dict) -> list[tuple[str, str, str]]:
         ("server", "url", server_url),
         ("audio", "speaker_volume", str(require_integer(audio["speaker_volume_percent"], "audio.speaker_volume_percent", 0, 100))),
         ("audio", "aec_enabled", str(audio["aec_enabled"]).lower()),
+        ("audio", "uplink_channels", str(uplink_channels)),
+        ("display", "rotation", str(rotation_degrees)),
         ("wifi", "ssid", require_string(wifi["ssid"], "wifi.ssid", 32)),
         ("wifi", "password", require_string(wifi["password"], "wifi.password", 63)),
         ("fulloch", "device_token", require_string(fulloch["device_token"], "fulloch.device_token", 256)),

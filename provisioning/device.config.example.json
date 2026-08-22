@@ -10,7 +10,11 @@
   },
   "audio": {
     "speaker_volume_percent": 65,
-    "aec_enabled": true
+    "aec_enabled": true,
+    "uplink_channels": 1
+  },
+  "display": {
+    "rotation_degrees": 0
   },
   "music": {
     "player": "spotify"

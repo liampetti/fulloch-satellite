@@ -1,4 +1,5 @@
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -133,10 +134,65 @@ static bool xml_value(const char *xml, const char *name, char *value, size_t val
     return true;
 }
 
+static size_t encode_utf8(char *output, uint32_t codepoint)
+{
+    if (codepoint <= 0x7f) {
+        output[0] = (char)codepoint;
+        return 1;
+    }
+    if (codepoint <= 0x7ff) {
+        output[0] = (char)(0xc0 | (codepoint >> 6));
+        output[1] = (char)(0x80 | (codepoint & 0x3f));
+        return 2;
+    }
+    if (codepoint <= 0xffff) {
+        output[0] = (char)(0xe0 | (codepoint >> 12));
+        output[1] = (char)(0x80 | ((codepoint >> 6) & 0x3f));
+        output[2] = (char)(0x80 | (codepoint & 0x3f));
+        return 3;
+    }
+    output[0] = (char)(0xf0 | (codepoint >> 18));
+    output[1] = (char)(0x80 | ((codepoint >> 12) & 0x3f));
+    output[2] = (char)(0x80 | ((codepoint >> 6) & 0x3f));
+    output[3] = (char)(0x80 | (codepoint & 0x3f));
+    return 4;
+}
+
+static bool decode_numeric_entity(const char *text, char *output, size_t *consumed, size_t *output_size)
+{
+    if (text[0] != '&' || text[1] != '#') {
+        return false;
+    }
+    size_t index = 2;
+    const int base = text[index] == 'x' || text[index] == 'X' ? 16 : 10;
+    index += base == 16;
+    uint32_t codepoint = 0;
+    const size_t digits_start = index;
+    for (; text[index] != '\0' && text[index] != ';'; ++index) {
+        const char character = text[index];
+        const int digit = character >= '0' && character <= '9' ? character - '0' :
+                          character >= 'a' && character <= 'f' ? character - 'a' + 10 :
+                          character >= 'A' && character <= 'F' ? character - 'A' + 10 : -1;
+        if (digit < 0 || digit >= base || codepoint > (0x10ffff - (uint32_t)digit) / (uint32_t)base) {
+            return false;
+        }
+        codepoint = codepoint * base + digit;
+    }
+    if (index == digits_start || text[index] != ';' || codepoint == 0 || codepoint > 0x10ffff ||
+        (codepoint >= 0xd800 && codepoint <= 0xdfff)) {
+        return false;
+    }
+    *output_size = encode_utf8(output, codepoint);
+    *consumed = index + 1;
+    return true;
+}
+
 static void decode_entities(char *text)
 {
     char *output = text;
     while (*text != '\0') {
+        size_t consumed;
+        size_t output_size;
         if (strncmp(text, "&amp;", 5) == 0) {
             *output++ = '&'; text += 5;
         } else if (strncmp(text, "&lt;", 4) == 0) {
@@ -145,6 +201,11 @@ static void decode_entities(char *text)
             *output++ = '>'; text += 4;
         } else if (strncmp(text, "&quot;", 6) == 0) {
             *output++ = '"'; text += 6;
+        } else if (strncmp(text, "&apos;", 6) == 0) {
+            *output++ = '\''; text += 6;
+        } else if (decode_numeric_entity(text, output, &consumed, &output_size)) {
+            output += output_size;
+            text += consumed;
         } else {
             *output++ = *text++;
         }
@@ -195,6 +256,14 @@ static void update_playback_state(void)
         ESP_LOGW(TAG, "Sonos album art download failed (HTTP %d)", artwork_status);
         return;
     }
+    esp_jpeg_image_cfg_t config = {
+        .indata = (uint8_t *)response->body,
+        .indata_size = response->length,
+        .outbuf = artwork_data,
+        .outbuf_size = SONOS_ARTWORK_SIZE,
+        .out_format = JPEG_IMAGE_FORMAT_RGB565,
+        .flags = {.swap_color_bytes = 1},
+    };
     esp_jpeg_image_output_t output;
     bool decoded = false;
     const esp_jpeg_image_scale_t scales[] = {
@@ -204,17 +273,11 @@ static void update_playback_state(void)
         JPEG_IMAGE_SCALE_1_8,
     };
     for (size_t index = 0; index < sizeof(scales) / sizeof(scales[0]); ++index) {
-        esp_jpeg_image_cfg_t config = {
-            .indata = (uint8_t *)response->body,
-            .indata_size = response->length,
-            .outbuf = artwork_data,
-            .outbuf_size = SONOS_ARTWORK_SIZE,
-            .out_format = JPEG_IMAGE_FORMAT_RGB565,
-            .out_scale = scales[index],
-            .flags = {.swap_color_bytes = 1},
-        };
-        decoded = esp_jpeg_decode(&config, &output) == ESP_OK &&
-                  output.width * output.height * sizeof(lv_color_t) <= SONOS_ARTWORK_SIZE;
+        config.out_scale = scales[index];
+        if (esp_jpeg_get_image_info(&config, &output) != ESP_OK || output.output_len > SONOS_ARTWORK_SIZE) {
+            continue;
+        }
+        decoded = esp_jpeg_decode(&config, &output) == ESP_OK;
         if (decoded) {
             break;
         }
