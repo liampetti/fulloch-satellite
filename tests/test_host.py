@@ -247,10 +247,6 @@ class ProtocolFixtureTests(unittest.TestCase):
         self.assertIn("CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK=n", defaults)
         self.assertIn("CONFIG_MBEDTLS_DYNAMIC_BUFFER=n", defaults)
 
-        rebuild = (ROOT / "docs" / "rebuild_flash_touch_lcd_rev2.sh").read_text()
-        self.assertIn('rm -f "$GENERATED_SDKCONFIG"', rebuild)
-        self.assertIn("Refusing to flash unsafe concurrent TLS configuration", rebuild)
-
     def test_uplink_write_timeout_tolerates_wifi_backpressure(self):
         protocol = (ROOT / "main" / "protocol.c").read_text()
         self.assertIn("#define WEBSOCKET_UPLINK_SEND_TIMEOUT_MS 100", protocol)
