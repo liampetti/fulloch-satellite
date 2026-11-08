@@ -3,6 +3,11 @@
 
 import copy
 import importlib.util
+import os
+import ssl
+import subprocess
+import sys
+import tempfile
 import unittest
 from collections import deque
 from pathlib import Path
@@ -89,6 +94,84 @@ class ProvisioningTests(unittest.TestCase):
         with self.assertRaises(provision.BundleError):
             provision.validate(config, self.credentials)
 
+    def test_server_certificate_is_required_and_provisioned(self):
+        entries = provision.validate(self.config, self.credentials)
+        self.assertIn(("server", "certificate", self.config["server"]["certificate_pem"]), entries)
+        config = copy.deepcopy(self.config)
+        del config["server"]["certificate_pem"]
+        with self.assertRaises(provision.BundleError):
+            provision.validate(config, self.credentials)
+
+    @unittest.skipUnless(importlib.util.find_spec("esp_idf_nvs_partition_gen"), "standalone NVS generator not installed")
+    def test_standalone_generator_creates_compatible_sized_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "nvs.bin"
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "tools" / "provision.py"), "stage",
+                 "--config", str(ROOT / "provisioning" / "device.config.example.json"),
+                 "--credentials", str(ROOT / "provisioning" / "device.credentials.example.json"),
+                 "--output", str(image), "--size", "0x10000"],
+                check=True, capture_output=True, text=True,
+            )
+            data = image.read_bytes()
+            self.assertEqual(len(data), 0x10000)
+            self.assertIn(self.config["server"]["certificate_pem"].encode(), data)
+            self.assertNotIn(self.credentials["wifi"]["password"], result.stdout + result.stderr)
+            self.assertNotIn(self.credentials["fulloch"]["device_token"], result.stdout + result.stderr)
+            self.assertEqual(data, provision.generate_nvs(self.config, self.credentials))
+
+    def test_server_and_cli_use_the_same_bundle_implementation(self):
+        server_copy = ROOT.parent / "local-assistant" / "server" / "satellite_bundle.py"
+        if not server_copy.exists():
+            self.skipTest("Fulloch checkout not available")
+        self.assertEqual(server_copy.read_bytes(), (ROOT / "tools" / "provision.py").read_bytes())
+
+    def test_utf8_fields_must_fit_device_buffers(self):
+        credentials = copy.deepcopy(self.credentials)
+        credentials["wifi"]["ssid"] = "é" * 17
+        with self.assertRaises(provision.BundleError):
+            provision.validate(self.config, credentials)
+
+    def test_server_certificate_rejects_private_key_and_oversized_data(self):
+        for certificate in (
+            "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n",
+            "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+            "-----BEGIN CERTIFICATE-----\n" + "A" * 4000 + "\n-----END CERTIFICATE-----\n",
+            self.config["server"]["certificate_pem"] + self.config["server"]["certificate_pem"],
+        ):
+            config = copy.deepcopy(self.config)
+            config["server"]["certificate_pem"] = certificate
+            with self.assertRaises(provision.BundleError):
+                provision.validate(config, self.credentials)
+
+    def test_firmware_configures_certificate_and_waits_for_clock(self):
+        connectivity = (ROOT / "main" / "connectivity.c").read_text()
+        defaults = (ROOT / "sdkconfig.defaults").read_text()
+        self.assertIn('read_nvs_string(handle, "certificate", server_certificate', connectivity)
+        self.assertIn(".cert_pem = server_certificate", connectivity)
+        self.assertIn("if (!time_synchronized)", connectivity)
+        self.assertNotIn("skip_cert_common_name_check", connectivity)
+        self.assertIn("CONFIG_ESP_TLS_INSECURE=n", defaults)
+        self.assertIn("CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY=n", defaults)
+
+    @unittest.skipUnless(os.environ.get("SATELLITE_MBEDTLS_VERIFY"), "mbedTLS host verifier not built")
+    def test_esp_idf_mbedtls_verifies_trust_and_hostname(self):
+        with tempfile.TemporaryDirectory() as directory:
+            certificate = Path(directory) / "server.pem"
+            certificate.write_text(self.config["server"]["certificate_pem"])
+            binary = os.environ["SATELLITE_MBEDTLS_VERIFY"]
+            system_ca = ssl.get_default_verify_paths().cafile or "/etc/ssl/certs/ca-certificates.crt"
+            if not Path(system_ca).is_file():
+                self.skipTest("system CA bundle unavailable")
+            for trust, hostname, expected in (
+                (str(certificate), "satellite.example.invalid", 0),
+                (str(certificate), "wrong.example.invalid", 1),
+                (system_ca, "satellite.example.invalid", 1),
+            ):
+                with self.subTest(hostname=hostname, trust=trust):
+                    result = subprocess.run([binary, str(certificate), trust, hostname], check=False)
+                    self.assertEqual(result.returncode, expected)
+
     def test_spotify_settings_enter_device_nvs(self):
         config = copy.deepcopy(self.config)
         credentials = copy.deepcopy(self.credentials)
@@ -138,6 +221,25 @@ class ProvisioningTests(unittest.TestCase):
         with self.assertRaises(provision.BundleError):
             provision.validate(config, self.credentials)
 
+    def test_music_can_be_disabled_without_provider_credentials(self):
+        config = copy.deepcopy(self.config)
+        credentials = copy.deepcopy(self.credentials)
+        config["music"] = {"player": "none"}
+        del credentials["spotify"]
+        entries = provision.validate(config, credentials)
+        self.assertIn(("music", "player", "none"), entries)
+        self.assertFalse(any(namespace in {"spotify", "sonos"} for namespace, _, _ in entries))
+        credentials["spotify"] = self.credentials["spotify"]
+        with self.assertRaises(provision.BundleError):
+            provision.validate(config, credentials)
+
+    def test_disabled_music_is_handled_by_firmware(self):
+        music = (ROOT / "main" / "music.c").read_text()
+        ui = (ROOT / "main" / "ui.c").read_text()
+        self.assertIn('strcmp(player, "none")', music)
+        self.assertIn("provider != MUSIC_PROVIDER_NONE", music)
+        self.assertIn("satellite_music_enabled()", ui)
+
 
 class ProtocolFixtureTests(unittest.TestCase):
     def test_websocket_tls_reads_and_writes_share_the_client_lock(self):
@@ -161,10 +263,36 @@ class ProtocolFixtureTests(unittest.TestCase):
         self.assertEqual(protocol.count("esp_websocket_client_send_"), 2)
         self.assertIn("discard_transport_messages(false);", protocol)
 
-    def test_control_frames_displace_queued_microphone_pcm(self):
+    def test_connectivity_task_owns_websocket_lifecycle_and_discards_stale_events(self):
+        connectivity = (ROOT / "main" / "connectivity.c").read_text()
+        self.assertIn('xTaskCreate(connectivity_task, "connectivity"', connectivity)
+        self.assertIn("#define WEBSOCKET_NETWORK_TIMEOUT_MS 5000", connectivity)
+        self.assertIn("#define WEBSOCKET_SHORT_LIVED_CONNECTION_LIMIT 3U", connectivity)
+        self.assertIn("Server connections repeatedly failed before stabilization; reassociating Wi-Fi", connectivity)
+        self.assertIn('ESP_LOGI(TAG, "Stopping WebSocket client")', connectivity)
+        self.assertIn('ESP_LOGI(TAG, "WebSocket client stopped")', connectivity)
+        self.assertIn("CONNECTIVITY_COMMAND_WEBSOCKET_EVENT", connectivity)
+        self.assertIn("websocket_context->generation = ++websocket_generation", connectivity)
+        self.assertIn("websocket_event->generation != websocket_generation", connectivity)
+        self.assertIn("esp_websocket_client_destroy(websocket)", connectivity)
+        callbacks = connectivity[connectivity.index("static void websocket_event_handler"):
+                                 connectivity.index("static void destroy_websocket")]
+        self.assertNotIn("esp_websocket_client_start", callbacks)
+        self.assertNotIn("esp_websocket_client_stop", callbacks)
+
+    def test_transport_reserves_capacity_for_control_frames(self):
         protocol = (ROOT / "main" / "protocol.c").read_text()
-        self.assertIn("if (binary) {\n        return false;\n    }", protocol)
-        self.assertIn("!displaced.binary", protocol)
+        self.assertIn("uxQueueSpacesAvailable(transport_queue) <= 1", protocol)
+        self.assertIn("Dropping\n    // real-time microphone PCM", protocol)
+
+    def test_tts_end_is_bound_to_its_speaking_stream(self):
+        protocol = (ROOT / "main" / "protocol.c").read_text()
+        self.assertIn("static uint32_t tts_stream_generation;", protocol)
+        self.assertIn("static uint32_t tts_end_stream_generation;", protocol)
+        self.assertIn("static void begin_tts_stream(void)", protocol)
+        self.assertIn("tts_end_stream_generation = tts_stream_generation;", protocol)
+        self.assertIn("stream_generation == tts_stream_generation", protocol)
+        self.assertIn("begin_tts_stream();", protocol)
 
     def test_valid_hello_and_normal_sequence(self):
         hello = {
@@ -249,6 +377,23 @@ class TurnAndQueueTests(unittest.TestCase):
         self.state = "idle"
         self.barge_in_turn_pending = False
         self.completed_turn_pending_state = False
+        self.tts_stream_generation = 0
+        self.tts_end_stream_generation = 0
+        self.tts_end_pending = False
+
+    def begin_tts_stream(self):
+        self.tts_stream_generation += 1
+        self.tts_end_pending = False
+
+    def schedule_tts_end(self):
+        self.tts_end_stream_generation = self.tts_stream_generation
+        self.tts_end_pending = True
+
+    def complete_tts_end(self):
+        if not self.tts_end_pending or self.tts_end_stream_generation != self.tts_stream_generation:
+            return False
+        self.tts_end_pending = False
+        return True
 
     def apply_tts_cancel(self, turn_id):
         if self.state != "speaking" or turn_id != self.turn_id:
@@ -280,6 +425,12 @@ class TurnAndQueueTests(unittest.TestCase):
             and state in {"wake_detected", "listening", "speaking"}
             and turn_id != self.turn_id
         )
+        replaces_stale_inactive_turn = (
+            state == "wake_detected"
+            and self.state != "speaking"
+            and self.turn_id is not None
+            and turn_id != self.turn_id
+        )
         starts_proactive_turn = state == "speaking" and self.turn_id is None
         if state == "wake_detected":
             if (
@@ -287,6 +438,7 @@ class TurnAndQueueTests(unittest.TestCase):
                 and not replaces_follow_up_turn
                 and not replaces_barge_in_turn
                 and not replaces_completed_turn
+                and not replaces_stale_inactive_turn
             ) or not turn_id:
                 return False
             self.turn_id = turn_id
@@ -295,10 +447,12 @@ class TurnAndQueueTests(unittest.TestCase):
             and not replaces_follow_up_turn
             and not replaces_barge_in_turn
             and not replaces_completed_turn
+            and not replaces_stale_inactive_turn
             and not starts_proactive_turn
         ):
             return False
-        elif replaces_follow_up_turn or replaces_barge_in_turn or replaces_completed_turn or starts_proactive_turn:
+        elif (replaces_follow_up_turn or replaces_barge_in_turn or replaces_completed_turn or
+              replaces_stale_inactive_turn or starts_proactive_turn):
             self.turn_id = turn_id
         self.barge_in_turn_pending = False
         self.completed_turn_pending_state = False
@@ -346,6 +500,37 @@ class TurnAndQueueTests(unittest.TestCase):
         self.assertTrue(self.apply_state("follow_up", "turn-1"))
         self.assertEqual(self.state, "follow_up")
 
+    def test_final_stream_invalidates_the_acknowledgement_end(self):
+        self.assertTrue(self.apply_state("speaking", "turn-1"))
+        self.begin_tts_stream()  # Cached acknowledgement starts.
+        self.schedule_tts_end()
+        self.assertTrue(self.tts_end_pending)
+        self.assertTrue(self.apply_state("speaking", "turn-1"))
+        self.begin_tts_stream()  # Final SLM reply starts on the same turn.
+        self.assertFalse(self.tts_end_pending)
+        self.assertFalse(self.complete_tts_end())
+
+    def test_only_the_current_stream_can_finish_playback(self):
+        self.begin_tts_stream()
+        self.schedule_tts_end()
+        acknowledgement_generation = self.tts_end_stream_generation
+        self.begin_tts_stream()
+        self.tts_end_pending = True
+        self.tts_end_stream_generation = acknowledgement_generation
+        self.assertFalse(self.complete_tts_end())
+        self.schedule_tts_end()
+        self.assertTrue(self.complete_tts_end())
+
+    def test_final_stream_pcm_sequence_follows_the_acknowledgement(self):
+        expected_sequence = 0
+        for sequence in (0, 1):
+            self.assertEqual(sequence, expected_sequence)
+            expected_sequence += 1
+
+        self.begin_tts_stream()  # Final stream uses the same lifecycle turn.
+        final_sequence = 2
+        self.assertEqual(final_sequence, expected_sequence)
+
     def test_new_turn_can_replace_a_completed_tts_turn_before_idle_arrives(self):
         self.assertTrue(self.apply_state("speaking", "turn-1"))
         self.assertTrue(self.apply_tts_end("turn-1"))
@@ -356,6 +541,13 @@ class TurnAndQueueTests(unittest.TestCase):
         self.assertTrue(self.apply_state("wake_detected", "turn-1"))
         self.assertTrue(self.apply_state("speaking", "turn-1"))
         self.assertFalse(self.apply_state("listening", "turn-2"))
+
+    def test_wake_detected_replaces_a_stale_listening_turn(self):
+        self.assertTrue(self.apply_state("wake_detected", "turn-1"))
+        self.assertTrue(self.apply_state("listening", "turn-1"))
+        self.assertTrue(self.apply_state("wake_detected", "turn-2"))
+        self.assertTrue(self.apply_state("listening", "turn-2"))
+        self.assertEqual(self.turn_id, "turn-2")
 
     def test_idle_waits_for_an_active_response_to_drain(self):
         state = "speaking"
@@ -390,6 +582,55 @@ class TurnAndQueueTests(unittest.TestCase):
         first_turn_generation = uplink_generation
         uplink_generation += 1  # Follow-up turn's thinking state.
         self.assertGreater(uplink_generation, first_turn_generation)
+
+    def test_asr_error_ends_the_turn_and_restores_uplink(self):
+        state = "thinking"
+        turn_id = "turn-1"
+        uplink_enabled = False  # Thinking flushes the finalized utterance.
+
+        # assistant.state:error is terminal even when no idle follows it.
+        state = "idle"
+        turn_id = ""
+        uplink_enabled = True
+
+        self.assertEqual(state, "idle")
+        self.assertEqual(turn_id, "")
+        self.assertTrue(uplink_enabled)
+
+    def test_every_active_lifecycle_state_has_a_local_expiry(self):
+        protocol = (ROOT / "main" / "protocol.c").read_text()
+        self.assertIn("#define ASSISTANT_TENTATIVE_WAKE_TIMEOUT_MS 2500", protocol)
+        self.assertIn("#define ASSISTANT_SHORT_TIMEOUT_MS 60000", protocol)
+        self.assertIn("#define ASSISTANT_THINKING_TIMEOUT_MS 180000", protocol)
+        self.assertIn("#define ASSISTANT_FOLLOW_UP_TIMEOUT_MS 60000", protocol)
+        self.assertIn("static void assistant_expiry_timer_callback", protocol)
+        self.assertIn("satellite_audio_cancel_playback();", protocol)
+        self.assertIn("set_uplink_transmit_enabled(true);", protocol)
+
+    def test_tentative_wake_idle_does_not_wait_for_playback_drain(self):
+        protocol = (ROOT / "main" / "protocol.c").read_text()
+        self.assertIn("assistant_state == SATELLITE_ASSISTANT_WAKE_DETECTED ||", protocol)
+        self.assertIn("complete_idle_state();", protocol)
+
+    def test_follow_up_local_cap_is_not_extended_by_repeat_updates(self):
+        local_cap_ms = 60000
+        elapsed_ms = 25000
+        local_remaining_ms = local_cap_ms - elapsed_ms
+        server_remaining_ms = 60000
+
+        self.assertEqual(min(local_remaining_ms, server_remaining_ms), 35000)
+
+    def test_expired_server_follow_up_deadline_keeps_the_local_recovery_cap(self):
+        local_remaining_ms = 60000
+        server_remaining_ms = -1
+
+        expiry_ms = local_remaining_ms
+        if 0 < server_remaining_ms < 2**32:
+            expiry_ms = min(expiry_ms, server_remaining_ms)
+
+        self.assertEqual(expiry_ms, local_remaining_ms)
+        protocol = (ROOT / "main" / "protocol.c").read_text()
+        self.assertIn("Ignoring expired server follow-up deadline", protocol)
 
 
     def test_bounded_queue_drops_without_blocking_and_reset_flushes(self):

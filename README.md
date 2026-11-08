@@ -43,6 +43,15 @@ Replace every example value before flashing. In particular:
 - Set the Wi-Fi credentials and a unique `fulloch.device_token`.
 - Set `server.url` to the local-network `wss://` endpoint exposed by the
   Fulloch server.
+- Set `server.certificate_pem` to the public PEM trust certificate for that
+  server (the self-signed dashboard certificate, or the CA certificate that
+  issued it). Encode its newlines as `\n` in JSON. Never include a private key.
+  The certificate is limited to 3,999 UTF-8 bytes and is stored in the 64 KiB
+  NVS partition. The URL hostname or IP must match the server certificate.
+  The device waits for SNTP before connecting so certificate dates are checked.
+  Reprovision after changing the server address or its trust certificate.
+  Existing bundles without a certificate must be updated before rebuilding;
+  older provisioned devices must be reflashed with a new bundle and firmware.
 - Set `audio.speaker_volume_percent` from 0 to 100. This controls the ES8311
   codec output level.
 - Leave `audio.aec_enabled` enabled to reduce speaker feedback.
@@ -51,7 +60,7 @@ Replace every example value before flashing. In particular:
   processing; this requires `audio.aec_enabled`.
 - Set `display.rotation_degrees` to `0` for the normal orientation or `180` to
   restore the previous upside-down display and touch orientation.
-- Select the music source with `music.player`. Options are `spotify` or `sonos` currently. If using Spotify controls, set `music.player` to `spotify` and add the Spotify client credentials to the json. Requires Spotify Premium. If you are using a Sonos speaker, set it to `sonos` and set `sonos.host` to the IP address of the Sonos speaker to control.
+- Select the music source with `music.player`: `none` disables the music view and needs no music credentials; `spotify` enables Spotify controls and requires Spotify Premium and Spotify client credentials; `sonos` controls a Sonos speaker at `sonos.host`.
 
 The example json is a valid Spotify configuration. To use Sonos, replace
 its `music` and `spotify` sections with the following, and remove the
@@ -65,6 +74,58 @@ its `music` and `spotify` sections with the following, and remove the
   "host": "192.168.1.50"
 }
 ```
+
+### Wizard Bundle Contract
+
+The USB wizard should construct schema version `1` for both JSON objects and
+pass them through the same bundle validation as the CLI. The following fields
+are specific to the Waveshare profile; no Home Assistant entity is needed.
+Secrets are requested for each attempt and must not be saved as retry state.
+String limits below are UTF-8 bytes, not Unicode character counts.
+
+| Section | Field | Wizard default / constraint |
+| --- | --- | --- |
+| `device` | `id`, `name`, `timezone` | Required nonempty strings, at most 64 characters each. Choose a unique ID. Timezone is the device's configured timezone. |
+| `server` | `url`, `certificate_pem` | Required `wss://` URL (up to 256 characters) and one public PEM trust certificate (up to 3,999 bytes). The user must confirm the reachable address. |
+| `wifi` credentials | `ssid`, `password` | Required nonempty strings, up to 32 and 63 characters respectively; do not prefill the password from prior attempts. |
+| `fulloch` credentials | `device_token` | Generated uniquely by the server, not entered as a CLI argument or displayed. Up to 256 characters. |
+| `audio` | `speaker_volume_percent`, `aec_enabled`, `uplink_channels` | Defaults: 65, true, 1. Volume is 0–100; uplink is 1 or 2, and 2 requires AEC. |
+| `display` | `rotation_degrees` | Defaults to 0; accepts 0 or 180. |
+| `music` | `player` | Default to `none`; alternatives are `spotify` and `sonos`. |
+| `spotify` credentials | `client_id`, `client_secret`, `refresh_token` | Required only for Spotify; limits are 256, 256 and 512 characters. Never store in retry state. |
+| `sonos` | `host` | Required only for Sonos, up to 63 characters. |
+
+For `none`, omit both `spotify` credentials and the `sonos` configuration.
+The example certificate is illustrative only; replace it with the actual public
+trust certificate for the server.
+
+The NVS generator is also available without an ESP-IDF installation. Install the
+pinned `requirements-provision.txt` in a Python environment, then run
+`python tools/provision.py stage --config <config.json> --credentials <credentials.json> --output <nvs.bin> --size 0x10000`.
+The generated image contains secrets: restrict access and remove it after use.
+This standalone generation does not build or flash firmware.
+Fulloch vendors the identical `tools/provision.py` as
+`server/satellite_bundle.py` and installs the same pinned generator in both
+server images. Update both copies together; the host tests check for drift when
+both repositories are checked out as siblings.
+
+### Release Artifacts
+
+Build with a specified `PROJECT_VER`, then export with
+`python tools/firmware_manifest.py --build build/touch-lcd-rev2 --version <version> --output <new-output-directory>`.
+The exporter checks the version embedded in the application and the compiled
+partition table before copying the public images. Its manifest records SHA-256
+checksums, byte sizes and flash offsets; the 64 KiB NVS slot is described but
+no device-specific NVS image, credentials or private key are published.
+The shipped `0.1.0` images were built with ESP-IDF 5.3.1. They have not yet
+passed the plan's physical Rev 2 hardware acceptance tests.
+
+For the optional certificate-verification host test, build the ESP-IDF 5.3.1
+mbedTLS submodule for the host, compile `tests/verify_certificate.c` against
+its X.509 and crypto libraries, and set `SATELLITE_MBEDTLS_VERIFY` to the
+resulting executable when running the host tests. This checks trusted,
+untrusted, and hostname-mismatched certificates using the ESP-IDF mbedTLS
+implementation; it does not replace testing the actual board.
 
 ### 3. Build And Flash
 

@@ -302,7 +302,7 @@ static void handle_long_press(lv_event_t *event)
 static void handle_swipe(lv_event_t *event)
 {
     (void)event;
-    if (assistant_state == SATELLITE_ASSISTANT_IDLE && idle_view_visible()) {
+    if (assistant_state == SATELLITE_ASSISTANT_IDLE && idle_view_visible() && satellite_music_enabled()) {
         show_idle_view(idle_view == UI_IDLE_VIEW_DATETIME ? UI_IDLE_VIEW_MUSIC : UI_IDLE_VIEW_DATETIME);
     }
 }

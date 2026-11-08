@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdbool.h>
+
 #include "lvgl.h"
 
 typedef enum {
@@ -11,3 +13,4 @@ typedef enum {
 
 void satellite_music_request(satellite_music_command_t command);
 const lv_img_dsc_t *satellite_music_album_art(void);
+bool satellite_music_enabled(void);

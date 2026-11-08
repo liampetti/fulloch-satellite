@@ -1,0 +1,1 @@
+esp-idf-nvs-partition-gen==0.1.7

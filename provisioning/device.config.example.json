@@ -6,7 +6,8 @@
     "timezone": "Australia/Sydney"
   },
   "server": {
-    "url": "wss://satellite.example.invalid/ws/satellite-v2"
+    "url": "wss://satellite.example.invalid/ws/satellite-v2",
+    "certificate_pem": "-----BEGIN CERTIFICATE-----\nMIIBczCCARigAwIBAgIUSq7MXWkiPkpoSTy/gXKyfV+SxwMwCgYIKoZIzj0EAwIw\nJDEiMCAGA1UEAwwZc2F0ZWxsaXRlLmV4YW1wbGUuaW52YWxpZDAeFw0yNTAxMDEw\nMDAwMDBaFw00NTAxMDEwMDAwMDBaMCQxIjAgBgNVBAMMGXNhdGVsbGl0ZS5leGFt\ncGxlLmludmFsaWQwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR/HGeYqYPbMJ8+\nfxcl+i0tqZvo8q6mIZrqRA70Xr4coU2sHU6zuyYaPsvQDjc5CSRamwl4EMxpzC+N\n46CijTncoygwJjAkBgNVHREEHTAbghlzYXRlbGxpdGUuZXhhbXBsZS5pbnZhbGlk\nMAoGCCqGSM49BAMCA0kAMEYCIQC3r3up+T3luxxm3lsY1bPLpGxqmsLGb1Bb8ZDS\n8UqxWQIhAKmAcHiO9qGduSKH2HdStyr5/1hHBh0HTNOksSmHn6T6\n-----END CERTIFICATE-----\n"
   },
   "audio": {
     "speaker_volume_percent": 65,

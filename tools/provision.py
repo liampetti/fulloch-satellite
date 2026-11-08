@@ -4,6 +4,9 @@
 import argparse
 import csv
 import json
+import os
+import re
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -30,16 +33,25 @@ def require_keys(value: dict, keys: set[str], name: str) -> None:
     if actual != keys:
         missing = ", ".join(sorted(keys - actual))
         extra = ", ".join(sorted(actual - keys))
-        details = ", ".join(part for part in (
-            f"missing: {missing}" if missing else "",
-            f"unknown: {extra}" if extra else "",
-        ) if part)
+        details = ", ".join(
+            part
+            for part in (
+                f"missing: {missing}" if missing else "",
+                f"unknown: {extra}" if extra else "",
+            )
+            if part
+        )
         raise BundleError(f"{name} has invalid fields ({details})")
 
 
 def require_string(value: object, name: str, maximum: int) -> str:
-    if not isinstance(value, str) or not value.strip() or len(value) > maximum:
-        raise BundleError(f"{name} must be a non-empty string of at most {maximum} characters")
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or "\x00" in value
+        or len(value.encode("utf-8")) > maximum
+    ):
+        raise BundleError(f"{name} must be a non-empty string of at most {maximum} UTF-8 bytes")
     return value
 
 
@@ -54,7 +66,11 @@ def validate(config: dict, credentials: dict) -> list[tuple[str, str, str]]:
     credential_keys = {"schema_version", "wifi", "fulloch"}
     optional_config_keys = {key for key in ("display", "sonos") if key in config}
     require_keys(config, config_keys | optional_config_keys, "config")
-    require_keys(credentials, credential_keys | ({"spotify"} if "spotify" in credentials else set()), "credentials")
+    require_keys(
+        credentials,
+        credential_keys | ({"spotify"} if "spotify" in credentials else set()),
+        "credentials",
+    )
     if config["schema_version"] != 1 or credentials["schema_version"] != 1:
         raise BundleError("bundle schema_version must be 1")
 
@@ -66,7 +82,7 @@ def validate(config: dict, credentials: dict) -> list[tuple[str, str, str]]:
     fulloch = credentials["fulloch"]
     for value, keys, name in (
         (device, {"id", "name", "timezone"}, "device"),
-        (server, {"url"}, "server"),
+        (server, {"url", "certificate_pem"}, "server"),
         (wifi, {"ssid", "password"}, "wifi"),
         (fulloch, {"device_token"}, "fulloch"),
     ):
@@ -75,8 +91,12 @@ def validate(config: dict, credentials: dict) -> list[tuple[str, str, str]]:
         require_keys(value, keys, name)
     if not isinstance(audio, dict):
         raise BundleError("audio must be an object")
-    require_keys(audio, {"speaker_volume_percent", "aec_enabled"} |
-                 ({"uplink_channels"} if "uplink_channels" in audio else set()), "audio")
+    require_keys(
+        audio,
+        {"speaker_volume_percent", "aec_enabled"}
+        | ({"uplink_channels"} if "uplink_channels" in audio else set()),
+        "audio",
+    )
     if display is not None:
         if not isinstance(display, dict):
             raise BundleError("display must be an object")
@@ -86,7 +106,11 @@ def validate(config: dict, credentials: dict) -> list[tuple[str, str, str]]:
         spotify_credentials = credentials["spotify"]
         if not isinstance(spotify_credentials, dict):
             raise BundleError("spotify credentials must be an object")
-        require_keys(spotify_credentials, {"client_id", "client_secret", "refresh_token"}, "spotify credentials")
+        require_keys(
+            spotify_credentials,
+            {"client_id", "client_secret", "refresh_token"},
+            "spotify credentials",
+        )
         require_string(spotify_credentials["client_id"], "spotify.client_id", 256)
         require_string(spotify_credentials["client_secret"], "spotify.client_secret", 256)
         require_string(spotify_credentials["refresh_token"], "spotify.refresh_token", 512)
@@ -94,8 +118,8 @@ def validate(config: dict, credentials: dict) -> list[tuple[str, str, str]]:
     if not isinstance(music, dict):
         raise BundleError("music must be an object")
     require_keys(music, {"player"}, "music")
-    if music["player"] not in {"spotify", "sonos"}:
-        raise BundleError("music.player must be spotify or sonos")
+    if not isinstance(music["player"], str) or music["player"] not in {"spotify", "sonos", "none"}:
+        raise BundleError("music.player must be spotify, sonos or none")
     if ("sonos" in config) != ("music" in config and config["music"]["player"] == "sonos"):
         raise BundleError("sonos configuration requires music.player set to sonos")
     if ("spotify" in credentials) != (music["player"] == "spotify"):
@@ -109,15 +133,34 @@ def validate(config: dict, credentials: dict) -> list[tuple[str, str, str]]:
 
     server_url = require_string(server["url"], "server.url", 256)
     parsed_url = urlsplit(server_url)
-    if parsed_url.scheme != "wss" or not parsed_url.hostname or parsed_url.username or parsed_url.password:
+    if (
+        parsed_url.scheme != "wss"
+        or not parsed_url.hostname
+        or parsed_url.username
+        or parsed_url.password
+    ):
         raise BundleError("server.url must be a wss:// URL without user credentials")
+    certificate = server["certificate_pem"]
+    if not isinstance(certificate, str) or len(certificate.encode("utf-8")) > 3999:
+        raise BundleError("server.certificate_pem must be a PEM certificate of at most 3999 bytes")
+    if not re.fullmatch(
+        r"-----BEGIN CERTIFICATE-----\n[A-Za-z0-9+/=\n]+-----END CERTIFICATE-----\n?", certificate
+    ):
+        raise BundleError("server.certificate_pem must contain one public PEM certificate")
+    try:
+        ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=certificate)
+    except (ValueError, ssl.SSLError) as error:
+        raise BundleError("server.certificate_pem is not a valid X.509 certificate") from error
     if not isinstance(audio["aec_enabled"], bool):
         raise BundleError("audio.aec_enabled must be a boolean")
-    uplink_channels = require_integer(audio.get("uplink_channels", 1), "audio.uplink_channels", 1, 2)
+    uplink_channels = require_integer(
+        audio.get("uplink_channels", 1), "audio.uplink_channels", 1, 2
+    )
     if uplink_channels == 2 and not audio["aec_enabled"]:
         raise BundleError("audio.uplink_channels requires audio.aec_enabled")
-    rotation_degrees = require_integer(display.get("rotation_degrees", 0) if display else 0,
-                                       "display.rotation_degrees", 0, 180)
+    rotation_degrees = require_integer(
+        display.get("rotation_degrees", 0) if display else 0, "display.rotation_degrees", 0, 180
+    )
     if rotation_degrees not in (0, 180):
         raise BundleError("display.rotation_degrees must be 0 or 180")
 
@@ -126,20 +169,35 @@ def validate(config: dict, credentials: dict) -> list[tuple[str, str, str]]:
         ("device", "name", require_string(device["name"], "device.name", 64)),
         ("device", "timezone", require_string(device["timezone"], "device.timezone", 64)),
         ("server", "url", server_url),
-        ("audio", "speaker_volume", str(require_integer(audio["speaker_volume_percent"], "audio.speaker_volume_percent", 0, 100))),
+        ("server", "certificate", certificate),
+        (
+            "audio",
+            "speaker_volume",
+            str(
+                require_integer(
+                    audio["speaker_volume_percent"], "audio.speaker_volume_percent", 0, 100
+                )
+            ),
+        ),
         ("audio", "aec_enabled", str(audio["aec_enabled"]).lower()),
         ("audio", "uplink_channels", str(uplink_channels)),
         ("display", "rotation", str(rotation_degrees)),
         ("wifi", "ssid", require_string(wifi["ssid"], "wifi.ssid", 32)),
         ("wifi", "password", require_string(wifi["password"], "wifi.password", 63)),
-        ("fulloch", "device_token", require_string(fulloch["device_token"], "fulloch.device_token", 256)),
+        (
+            "fulloch",
+            "device_token",
+            require_string(fulloch["device_token"], "fulloch.device_token", 256),
+        ),
     ]
     if "spotify" in credentials:
-        values.extend([
-            ("spotify", "client_id", spotify_credentials["client_id"]),
-            ("spotify", "client_secret", spotify_credentials["client_secret"]),
-            ("spotify", "refresh_token", spotify_credentials["refresh_token"]),
-        ])
+        values.extend(
+            [
+                ("spotify", "client_id", spotify_credentials["client_id"]),
+                ("spotify", "client_secret", spotify_credentials["client_secret"]),
+                ("spotify", "refresh_token", spotify_credentials["refresh_token"]),
+            ]
+        )
     if "music" in config:
         values.append(("music", "player", config["music"]["player"]))
     if "sonos" in config:
@@ -159,6 +217,38 @@ def write_csv(entries: list[tuple[str, str, str]], output: Path) -> None:
             writer.writerow((key, "data", "string", value))
 
 
+def generate_nvs(
+    config: dict, credentials: dict, *, size: int = 0x10000, nvs_generator: Path | None = None
+) -> bytes:
+    """Generate an NVS partition without leaving secret files behind."""
+    if size != 0x10000:
+        raise BundleError("NVS size must match the 0x10000-byte firmware partition")
+    entries = validate(config, credentials)
+    if nvs_generator is not None and not nvs_generator.is_file():
+        raise BundleError("NVS generator not found")
+    with tempfile.TemporaryDirectory() as directory:
+        csv_path = Path(directory) / "nvs.csv"
+        image_path = Path(directory) / "nvs.bin"
+        write_csv(entries, csv_path)
+        generator = (
+            [str(nvs_generator)]
+            if nvs_generator is not None
+            else ["-m", "esp_idf_nvs_partition_gen"]
+        )
+        result = subprocess.run(
+            [sys.executable, *generator, "generate", str(csv_path), str(image_path), hex(size)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if result.returncode != 0 or not image_path.is_file():
+            raise BundleError("NVS generation failed; check that the pinned generator is installed")
+        data = image_path.read_bytes()
+        if len(data) != size:
+            raise BundleError("NVS generator produced an unexpected image size")
+        return data
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -168,24 +258,30 @@ def main() -> int:
         command_parser.add_argument("--credentials", required=True, type=Path)
         if command == "stage":
             command_parser.add_argument("--output", required=True, type=Path)
-            command_parser.add_argument("--nvs-generator", required=True, type=Path)
+            command_parser.add_argument(
+                "--nvs-generator",
+                type=Path,
+                help="ESP-IDF generator script (defaults to installed Python package)",
+            )
             command_parser.add_argument("--size", required=True)
     args = parser.parse_args()
 
     try:
-        entries = validate(load_json(args.config), load_json(args.credentials))
+        config = load_json(args.config)
+        credentials = load_json(args.credentials)
         if args.command == "stage":
-            if not args.nvs_generator.is_file():
-                raise BundleError(f"NVS generator not found: {args.nvs_generator}")
+            try:
+                size = int(args.size, 0)
+            except ValueError as error:
+                raise BundleError("NVS size must be an integer") from error
+            image = generate_nvs(config, credentials, size=size, nvs_generator=args.nvs_generator)
             args.output.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.TemporaryDirectory() as directory:
-                csv_path = Path(directory) / "nvs.csv"
-                write_csv(entries, csv_path)
-                subprocess.run(
-                    [sys.executable, str(args.nvs_generator), "generate", str(csv_path), str(args.output), args.size],
-                    check=True,
-                )
-    except (BundleError, subprocess.CalledProcessError) as error:
+            descriptor = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(image)
+        else:
+            validate(config, credentials)
+    except (BundleError, OSError) as error:
         print(f"provisioning error: {error}", file=sys.stderr)
         return 1
     print("provisioning bundle is valid")

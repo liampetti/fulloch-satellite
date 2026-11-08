@@ -388,7 +388,15 @@ esp_err_t satellite_spotify_start(void)
     requests = xQueueCreate(SPOTIFY_QUEUE_DEPTH, sizeof(satellite_spotify_command_t));
     if (requests == NULL ||
         xTaskCreateWithCaps(spotify_task, "spotify", SPOTIFY_TASK_STACK_BYTES, NULL, 4, NULL,
-                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+        if (requests != NULL) {
+            vQueueDelete(requests);
+            requests = NULL;
+        }
+        free(response);
+        free(artwork_data);
+        response = NULL;
+        artwork_data = NULL;
         return ESP_ERR_NO_MEM;
     }
     ESP_LOGI(TAG, "Spotify controls are ready");

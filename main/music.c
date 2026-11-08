@@ -11,6 +11,7 @@
 typedef enum {
     MUSIC_PROVIDER_SPOTIFY,
     MUSIC_PROVIDER_SONOS,
+    MUSIC_PROVIDER_NONE,
 } music_provider_t;
 
 static const char *TAG = "music";
@@ -33,6 +34,8 @@ static void load_provider(void)
     nvs_close(handle);
     if (error == ESP_OK && strcmp(player, "sonos") == 0) {
         provider = MUSIC_PROVIDER_SONOS;
+    } else if (error == ESP_OK && strcmp(player, "none") == 0) {
+        provider = MUSIC_PROVIDER_NONE;
     } else if (error == ESP_OK && strcmp(player, "spotify") != 0) {
         ESP_LOGW(TAG, "Unknown provisioned music player");
     }
@@ -43,7 +46,7 @@ void satellite_music_request(satellite_music_command_t command)
     load_provider();
     if (provider == MUSIC_PROVIDER_SONOS) {
         satellite_sonos_request((satellite_sonos_command_t)command);
-    } else {
+    } else if (provider == MUSIC_PROVIDER_SPOTIFY) {
         satellite_spotify_request((satellite_spotify_command_t)command);
     }
 }
@@ -51,5 +54,14 @@ void satellite_music_request(satellite_music_command_t command)
 const lv_img_dsc_t *satellite_music_album_art(void)
 {
     load_provider();
-    return provider == MUSIC_PROVIDER_SPOTIFY ? satellite_spotify_album_art() : satellite_sonos_album_art();
+    if (provider == MUSIC_PROVIDER_SPOTIFY) {
+        return satellite_spotify_album_art();
+    }
+    return provider == MUSIC_PROVIDER_SONOS ? satellite_sonos_album_art() : NULL;
+}
+
+bool satellite_music_enabled(void)
+{
+    load_provider();
+    return provider != MUSIC_PROVIDER_NONE;
 }

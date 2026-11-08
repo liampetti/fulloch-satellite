@@ -27,6 +27,7 @@ void satellite_protocol_handle_data(esp_websocket_client_handle_t websocket,
 esp_err_t satellite_protocol_send_uplink(const int16_t *samples, size_t sample_count);
 satellite_assistant_state_t satellite_protocol_assistant_state(void);
 bool satellite_protocol_ready(void);
+int64_t satellite_protocol_last_server_activity_us(void);
 esp_err_t satellite_protocol_send_stop(void);
 esp_err_t satellite_protocol_set_conversation_mode(bool enabled);
 void satellite_protocol_playback_frame_completed(uint32_t sequence);

@@ -42,6 +42,7 @@ static const char *TAG = "waveshare_rev2";
 #define I2S_SAMPLE_RATE_HZ 16000
 #define CAPTURE_SAMPLES_PER_FRAME (I2S_SAMPLE_RATE_HZ / 50)
 #define PLAYBACK_BLOCK_SAMPLES 128
+#define PLAYBACK_WRITE_TIMEOUT_MS 1000
 #define LCD_WIDTH 360
 #define LCD_HEIGHT 360
 #define LCD_ROWS_PER_TRANSFER 10
@@ -480,7 +481,9 @@ esp_err_t waveshare_touch_lcd_185c_init_playback(void)
         .codec_mode = ESP_CODEC_DEV_WORK_MODE_DAC,
         .ctrl_if = control_if,
         .gpio_if = gpio_if,
-        .pa_pin = PA_ENABLE,
+        // Playback start/stop owns PA_ENABLE so the amplifier can warm before
+        // the downlink task begins its first I2S write.
+        .pa_pin = -1,
         .use_mclk = true,
     };
     const audio_codec_if_t *codec_if = es8311_codec_new(&codec_config);
@@ -534,8 +537,14 @@ esp_err_t waveshare_touch_lcd_185c_play_mono_s16le(const int16_t *samples, size_
         }
         const size_t bytes = block_samples * 2 * sizeof(*playback_samples);
         size_t bytes_written = 0;
-        ESP_RETURN_ON_ERROR(i2s_channel_write(i2s_tx, playback_samples, bytes, &bytes_written, portMAX_DELAY),
-                            TAG, "I2S playback write failed");
+        const esp_err_t error = i2s_channel_write(i2s_tx, playback_samples, bytes, &bytes_written,
+                                                  pdMS_TO_TICKS(PLAYBACK_WRITE_TIMEOUT_MS));
+        if (error == ESP_ERR_TIMEOUT) {
+            ESP_LOGW(TAG, "I2S playback write timed out; resetting TX channel");
+            ESP_RETURN_ON_ERROR(i2s_channel_disable(i2s_tx), TAG, "I2S TX reset failed");
+            ESP_RETURN_ON_ERROR(i2s_channel_enable(i2s_tx), TAG, "I2S TX restart failed");
+        }
+        ESP_RETURN_ON_ERROR(error, TAG, "I2S playback write failed");
         ESP_RETURN_ON_FALSE(bytes_written == bytes, ESP_FAIL, TAG, "short I2S playback write");
     }
     return ESP_OK;

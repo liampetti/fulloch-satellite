@@ -143,7 +143,12 @@ static void log_audio_output_levels(const int16_t *samples, size_t sample_count)
             maximum = samples[sample];
         }
     }
-    ESP_LOGI("audio", "AEC output: %u samples, range=%d..%d", (unsigned int)sample_count, minimum, maximum);
+    ESP_LOGI("audio", "AEC output: %u samples, range=%d..%d [internal=%u/%u psram=%u/%u]",
+             (unsigned int)sample_count, minimum, maximum,
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned int)heap_caps_get_total_size(MALLOC_CAP_INTERNAL),
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             (unsigned int)heap_caps_get_total_size(MALLOC_CAP_SPIRAM));
 }
 
 static esp_err_t configure_playback_volume(void)
@@ -369,10 +374,24 @@ static void downlink_playback_task(void *argument)
         }
         if (downlink_input->generation == playback_generation) {
             if (!playback_started) {
+                // A consecutive server turn can arrive after the prior turn
+                // powered down the amplifier without an idle-to-speaking edge.
+                // Enable it here as well as on that state transition so this
+                // preroll always warms the analogue path.
+                if (waveshare_touch_lcd_185c_start_playback() != ESP_OK) {
+                    ESP_LOGW("audio", "Unable to enable playback amplifier");
+                }
                 const int64_t preroll_deadline_us = esp_timer_get_time() + PLAYBACK_PREROLL_MS * 1000;
-                while (uxQueueMessagesWaiting(downlink_queue) == 0 &&
-                       esp_timer_get_time() < preroll_deadline_us) {
+                // The amplifier is enabled when speaking starts. Keep it on for
+                // the full warm-up interval before its first I2S samples arrive.
+                while (esp_timer_get_time() < preroll_deadline_us) {
                     vTaskDelay(pdMS_TO_TICKS(PLAYBACK_PREROLL_POLL_MS));
+                }
+                // Cancellation can occur while the analogue path warms. Do
+                // not revive an invalidated frame after the preroll delay.
+                if (downlink_input->generation != playback_generation) {
+                    xQueueSend(downlink_free_queue, &downlink_input, 0);
+                    continue;
                 }
                 playback_started = true;
             }
