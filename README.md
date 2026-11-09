@@ -40,6 +40,8 @@ cp provisioning/device.credentials.example.json provisioning/device.credentials.
 Replace every example value before flashing. In particular:
 
 - Set unique `device.id` and `device.name` values.
+- Set `device.timezone` to a supported IANA name or a POSIX TZ string, as
+  described below.
 - Set the Wi-Fi credentials and a unique `fulloch.device_token`.
 - Set `server.url` to the local-network `wss://` endpoint exposed by the
   Fulloch server.
@@ -75,6 +77,24 @@ its `music` and `spotify` sections with the following, and remove the
 }
 ```
 
+### Device Timezone
+
+The firmware supports these IANA timezone names:
+
+- `Australia/Sydney`, `Australia/Melbourne`, `Australia/Brisbane`, `Australia/Perth`
+- `America/Los_Angeles`, `America/Denver`, `America/Phoenix`, `America/Chicago`, `America/New_York`
+- `Europe/London`, `Europe/Berlin`, `Europe/Paris`, `Etc/UTC`
+
+For other regions, supply a POSIX TZ string instead of an IANA name, for
+example `PST8PDT,M3.2.0,M11.1.0` for Pacific time or
+`GMT0BST,M3.5.0/1,M10.5.0` for London. POSIX offsets have the opposite sign
+to UTC offsets; include daylight-saving transition rules where needed. The
+firmware has no full timezone database, and these rules may need updating when
+local laws change. Unsupported IANA-style names cause a startup error in the
+device log. Other strings are passed to the C library without validation, so
+an invalid POSIX string may still produce the wrong time. Reprovision and flash
+after changing the timezone.
+
 ### Wizard Bundle Contract
 
 The USB wizard should construct schema version `1` for both JSON objects and
@@ -85,7 +105,7 @@ String limits below are UTF-8 bytes, not Unicode character counts.
 
 | Section | Field | Wizard default / constraint |
 | --- | --- | --- |
-| `device` | `id`, `name`, `timezone` | Required nonempty strings, at most 64 characters each. Choose a unique ID. Timezone is the device's configured timezone. |
+| `device` | `id`, `name`, `timezone` | Required nonempty strings, at most 64 characters each. Choose a unique ID. Timezone must be a supported IANA name or POSIX TZ string (see Device Timezone). |
 | `server` | `url`, `certificate_pem` | Required `wss://` URL (up to 256 characters) and one public PEM trust certificate (up to 3,999 bytes). The user must confirm the reachable address. |
 | `wifi` credentials | `ssid`, `password` | Required nonempty strings, up to 32 and 63 characters respectively; do not prefill the password from prior attempts. |
 | `fulloch` credentials | `device_token` | Generated uniquely by the server, not entered as a CLI argument or displayed. Up to 256 characters. |

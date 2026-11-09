@@ -19,6 +19,7 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "protocol.h"
+#include "timezone.h"
 #include "ui.h"
 
 #define WIFI_RECONNECT_INITIAL_MS 1000U
@@ -228,14 +229,6 @@ static esp_err_t load_provisioning(void)
     error = read_nvs_string(handle, "timezone", timezone, sizeof(timezone));
     nvs_close(handle);
     return error;
-}
-
-static const char *posix_timezone(const char *configured_timezone)
-{
-    if (strcmp(configured_timezone, "Australia/Sydney") == 0) {
-        return "AEST-10AEDT,M10.1.0,M4.1.0/3";
-    }
-    return configured_timezone;
 }
 
 static void schedule_wifi_reconnect(void)
@@ -652,7 +645,12 @@ esp_err_t satellite_connectivity_start(void)
         ESP_LOGE(TAG, "Provisioning bundle is missing or invalid (%s)", esp_err_to_name(error));
         return error;
     }
-    if (setenv("TZ", posix_timezone(timezone), 1) != 0) {
+    const char *tz = satellite_posix_timezone(timezone);
+    if (tz == NULL) {
+        ESP_LOGE(TAG, "Unsupported timezone '%s'; use a supported IANA name or a POSIX TZ string", timezone);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (setenv("TZ", tz, 1) != 0) {
         ESP_LOGE(TAG, "Unable to set device timezone");
         return ESP_FAIL;
     }
